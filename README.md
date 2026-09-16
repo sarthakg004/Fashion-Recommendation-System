@@ -425,6 +425,36 @@ above, and it is the best place to start reading.
 Everything here runs on a single RTX 4060 with 8 GB of VRAM. The longest single step is
 the image embedding extraction at about 90 seconds per encoder.
 
+## The web app
+
+There is a small React front end that serves the two-stage model's recommendations, so
+you can click through customers instead of reading a metrics table.
+
+![Aurora web app](docs/images/webapp.png)
+
+Fitting the two-stage model takes several minutes, so the API does not do it per
+request. `api/precompute.py` runs the model once and caches its output — the top twelve
+per customer, what that customer actually bought in the held-out week, their recent
+purchase history, and the article metadata. These are the same predictions that produced
+the score in the table above; nothing is re-ranked at serve time.
+
+```bash
+python api/precompute.py                        # about 6 minutes, writes api/artifacts/
+python -m uvicorn api.main:app --port 8000      # FastAPI on :8000
+
+cd web && npm install && npm run dev            # Vite on :5173, proxies /api
+```
+
+The API is four endpoints: `/api/metrics`, `/api/customers`, `/api/customers/{id}` and
+`/api/images/{article_id}`, each a thin call into a `RecommendationStore` that loads the
+cached parquet once and answers from memory.
+
+One thing about the customer list is worth explaining, because it would otherwise
+flatter the model. It is sorted by how many hits the model got, best first. Sorted
+randomly you would click through a dozen customers and see nothing highlighted at all,
+because the real hit rate is about 12% — the app says so in a footnote rather than
+letting the ordering imply otherwise.
+
 ## Layout
 
 ```
@@ -433,6 +463,14 @@ data/
   extract_image_embeddings.py        frozen encoders, one embedding per article
   image_embeddings_clip.parquet      cached CLIP vectors
   image_embeddings_resnet18.parquet  cached ResNet-18 vectors
+api/
+  precompute.py                      runs the model once, caches what the API serves
+  store.py                           RecommendationStore, reads the cached parquet
+  main.py                            FastAPI routes
+web/
+  src/App.jsx                        the page
+  src/api.js                         AuroraApi client
+  src/components/                    ProductCard, CustomerList, Section
 src/
   data_utils.py                      shared loading, and the refit-on-train+val rule
   metrics.py                         precision, recall, hit rate, NDCG, MAP

@@ -5,3 +5,6 @@ __pycache__/
 data/raw/
 data/sample/
 data/*.parquet
+
+web/node_modules/
+web/dist/

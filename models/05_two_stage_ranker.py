@@ -264,7 +264,8 @@ def build_training_pool(n_weeks: int = LABEL_WEEKS, verbose: bool = True) -> pl.
     return pl.concat(weeks).sort("week", "customer_id")
 
 
-def run(retrievers: list[Retriever] | None = None, n_weeks: int = LABEL_WEEKS, verbose: bool = True) -> dict:
+def run(retrievers: list[Retriever] | None = None, n_weeks: int = LABEL_WEEKS, verbose: bool = True,
+        save: bool = True) -> dict:
     """Fit both stages and return everything the notebook wants to look at."""
     retrievers = retrievers or default_retrievers()
     fitting = load_fitting_data()
@@ -285,7 +286,8 @@ def run(retrievers: list[Retriever] | None = None, n_weeks: int = LABEL_WEEKS, v
 
     predictions = rank_pool(model, test_pool, test_truth, features, bestsellers)
     scores = evaluate(predictions, test_truth)
-    save_result(MODEL_NAME, scores)
+    if save:
+        save_result(MODEL_NAME, scores)
 
     return dict(
         scores=scores, predictions=predictions, model=model, test_pool=test_pool, train_pool=train_pool,
