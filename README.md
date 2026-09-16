@@ -230,41 +230,49 @@ the image is a useful supplement rather than a replacement.
 
 Models 2 and 3 each use half the evidence. ALS sees co-purchases and nothing about the
 items; the content model sees the items and nothing about who buys together. A two-tower
-network learns both at once. One tower turns a customer into a vector, the other turns
-an article into a vector, and training pushes each customer towards the articles they
+network learns both at once. One tower turns a customer into a vector, the other turns an
+article into a vector, and training pushes each customer towards the articles they
 actually bought.
 
-The item tower reads the same content features as model 3, plus a free per-article
-vector learned from the interactions themselves. That learned part is what carries the
-collaborative signal, and it stays at its zero starting value for articles nobody
-bought, so cold-start items fall back to pure content and still work. The user tower
-reads the recency-weighted average of what the customer bought together with their age,
-club status and news preferences.
+The item tower reads the same content features as model 3, plus a free per-article vector
+learned from the interactions themselves. That learned part carries the collaborative
+signal, and it stays at its zero starting value for articles nobody bought, so cold-start
+items fall back to pure content and still work. The user tower reads the recency-weighted
+average of what the customer bought together with their age, club status and news
+preferences.
 
 Training uses in-batch negatives: inside a batch of (customer, bought article) pairs,
 every other customer's article counts as a negative, so a single matrix multiply gives
-thousands of negatives for free.
+thousands of negatives for free. Three details decide whether that works.
 
-One detail decides whether this trains at all. The user vector is an average of the
-articles the customer bought, so if the target article is left inside that average, the
-model can score it by recognising itself and learns nothing useful. Every training pair
-subtracts its own article from the customer's average before the forward pass.
+**The positive has to be removed from the user's own average.** The user vector is an
+average of purchased articles, so leaving the target inside it lets the model score that
+article by recognising itself, which teaches it nothing. Every training pair subtracts its
+own article before the forward pass.
 
-**This model came last among the personalised models on MAP@12, and I left it that
-way.** Temperature turned out to be the dominant setting — raising it from 0.05 to 0.15
-moved validation MAP@12 from 0.0129 to 0.0157 — and the learned item vector only helped
-at the lower learning rate; at 1e-3 the model memorised instead, with training loss
-falling while validation got worse. Even properly tuned it does not catch ALS. With
-309,000 interactions across 28,000 articles this is a small dataset for a neural
-retriever, and matrix factorisation is very hard to beat at that size. That is a real
-finding rather than a bug to tune away.
+**In-batch negatives are biased towards popular items.** A popular article turns up as a
+negative far more often, so the model learns to push it down for being popular rather than
+for being wrong. Subtracting the log of each item's frequency from the logits corrects for
+that sampling bias and is worth about 8% on the validation week.
+
+**Training has to stop at the right time.** Validation stops improving around epoch 15
+while the training loss keeps falling for another ten, so the model trains with early
+stopping and a patience of ten, and the best weights are restored.
+
+![Two-tower training curve](docs/images/two_tower_training.png)
+
+Capacity was picked by averaging three seeds rather than trusting one run, because a
+single run moves by more than the gap between neighbouring sizes. Towers of 1024 and 256
+beat 512 and 256 by about three times the run-to-run spread, narrower was clearly worse,
+and more dropout hurt at every width I tried.
+
+This model still ranks below ALS on MAP@12, and that is a real result rather than
+something to tune away: 309,000 interactions across 28,000 articles is a small dataset for
+a neural retriever. But it has the **best recall@100 of any single model here**, which is
+what matters for the job it actually does in the final system, where it feeds candidates
+to a ranker rather than answering on its own.
 
 ![Two-tower recommendations](docs/images/demo_two_tower.png)
-
-It still earns its place in the candidate pool. Its recall@100 (0.081) beats the
-content model's (0.073) even though its MAP@12 is lower than both, so it finds articles
-the others miss and simply orders them worse — which is exactly the division of labour
-the last model assumes.
 
 ### 5. Two-stage: multi-recall plus a LightGBM ranker
 
@@ -274,18 +282,18 @@ The solutions that won this competition did not pick one of these — they poole
 candidates from several cheap retrievers and trained a ranker to sort the pool.
 
 **Stage one** lives in `src/retrievers.py`: a `Retriever` base class with six
-implementations. Three of them wrap models 2 to 4. The other three are heuristics that
-cost almost nothing, and they matter more than the models do:
+implementations, of which the pool uses two. `RecentBestsellers` takes the 700 articles
+that sold most in the last seven days, and `TwoTowerRetriever` takes model 4's top 700 for
+that customer. Together they put about a thousand candidates per customer in front of the
+ranker and make roughly 48% of the right answers reachable.
 
-- `RecentBestsellers` — what sold most in the last seven days. On its own, the top 300
-  of this list reaches a recall of 0.178 on the test week, which is more than the entire
-  four-model pool managed before it was added.
-- `PreviousPurchases` — the customer's own articles, most recent first. About eight
-  candidates per customer, and the highest precision per candidate of anything here.
-- `ColourVariants` — other colourways of garments they already bought. H&M gives every
-  colourway of a garment the same `product_code`, so this is a single join.
+Using two retrievers rather than six is not a simplification for its own sake. The
+heuristics that were in the pool saturate: a customer has only about eight previous
+purchases to re-offer, and about fifty colour variants of what they bought, so they stop
+contributing once the pool grows. Bestsellers and the two-tower keep paying as k rises. All
+six classes stay in the file because they are cheap to pool back in.
 
-**Stage two** describes every (customer, candidate) pair with thirteen features and
+**Stage two** describes every (customer, candidate) pair with nine features and
 trains LightGBM's `lambdarank` on them: each retriever's rank for that pair, how many of
 the six nominated it, the best rank any of them gave it, the article's purchase count,
 popularity rank and days since it last sold, how often this customer already bought it,
@@ -313,12 +321,16 @@ lands within 1.5% of the same score.
 
 Two results from this are more interesting than the score.
 
-**The bottleneck moved.** An earlier version pooled only the four trained models and
-reached a recall ceiling of 0.085 — and the ranker extracted 97% of it. Ranking was
-saturated and recall was the constraint, so adding the heuristic retrievers was the
-obvious fix. The ceiling is now about 0.32, and the ranker reaches roughly half of it.
-Recall is no longer what limits this system; ordering is. That points at richer ranker
-features rather than more candidates.
+**The bottleneck moved, twice.** The first version pooled only the four trained models,
+reached a ceiling of 0.085, and the ranker extracted 97% of it: ranking was saturated and
+recall was the only lever worth pulling. Adding cheap heuristic retrievers lifted the
+ceiling to 0.32. Improving the two-tower and pooling it with recent bestsellers at a
+thousand candidates lifted it again to about 0.48.
+
+The ranker now converts roughly a third of that into recall@100. The last step makes the
+point plainly: the ceiling rose by half and MAP@12 moved about two percent. The right
+articles are in the pool and the ranker cannot yet tell which of them matter, so the next
+gain has to come from better features on the pairs rather than from more candidates.
 
 **The most useful features are not the model ranks.** Article purchase count, customer
 activity and how recently an article sold all outrank every retriever's opinion. The
@@ -335,14 +347,14 @@ something during that week.
 | 01 popularity | 0.00283 | 0.01146 | 0.03201 | 0.00715 | 0.00350 | 0.00142 | 0.02345 | 0.06426 | 0.01045 | 0.00396 | 0.00126 | 0.04052 | 0.10686 | 0.01427 | 0.00424 |
 | 02 collaborative ALS | 0.00959 | 0.05196 | 0.09338 | 0.03547 | 0.02434 | 0.00375 | 0.07603 | 0.14320 | 0.04222 | 0.02555 | 0.00238 | 0.09462 | 0.17786 | 0.04611 | 0.02587 |
 | 03 content-based | 0.00590 | 0.03319 | 0.06065 | 0.02492 | 0.01833 | 0.00256 | 0.05383 | 0.10181 | 0.03053 | 0.01934 | 0.00185 | 0.07272 | 0.14176 | 0.03465 | 0.01967 |
-| 04 two-tower | 0.00644 | 0.03484 | 0.06546 | 0.02366 | 0.01579 | 0.00288 | 0.05933 | 0.10975 | 0.03027 | 0.01698 | 0.00205 | 0.07986 | 0.14874 | 0.03471 | 0.01736 |
-| **05 two-stage ranker** | **0.01177** | **0.06243** | **0.11721** | **0.04137** | **0.02732** | **0.00589** | **0.11645** | **0.22695** | **0.05625** | **0.02993** | **0.00424** | **0.16062** | **0.31119** | **0.06574** | **0.03072** |
+| 04 two-tower | 0.00870 | 0.04385 | 0.08688 | 0.02992 | 0.01943 | 0.00493 | 0.09357 | 0.18195 | 0.04360 | 0.02191 | 0.00369 | 0.13546 | 0.25560 | 0.05262 | 0.02271 |
+| **05 two-stage ranker** | **0.01227** | **0.06380** | **0.12395** | **0.04248** | **0.02763** | **0.00631** | **0.11998** | **0.24212** | **0.05814** | **0.03029** | **0.00464** | **0.16831** | **0.32876** | **0.06869** | **0.03120** |
 
 ![Final comparison](docs/images/comparison_chart.png)
 
 The two-stage system ends up at about 8 times the popularity floor on MAP@12 and
 nearly four times its hit rate, and it wins on every single column. It also beats its own
-best retriever, ALS, by 12% — which is the thing a two-stage system has to do to justify
+best retriever, ALS, by 14% — which is the thing a two-stage system has to do to justify
 existing.
 
 ## What these numbers actually mean
@@ -352,7 +364,7 @@ They are small, and they are supposed to be. The team that won this competition 
 multi-strategy recall ensemble. Anyone quoting a much higher number on this task is
 usually measuring something easier.
 
-It helps to think about what MAP@12 of 0.027 represents. A typical customer bought two
+It helps to think about what MAP@12 of 0.028 represents. A typical customer bought two
 or three things during the test week, out of a catalog of 28,000 articles, and about a
 fifth of what they bought had never been sold before. Getting one of those twelve slots
 right about 12% of the time is not a broken model — it is a genuinely hard prediction.
@@ -389,9 +401,10 @@ express. A small transformer over the purchase sequence is the standard answer.
 ceiling from 0.085 to 0.32, and there is more left: larger k per retriever, an item-item
 cosine kNN retriever, and candidates drawn from what similar customers bought.
 
-**Correct the two-tower's negative sampling.** In-batch negatives are biased towards
-popular items, since popular articles appear as negatives more often. The standard logQ
-correction adjusts for this and would likely close part of the gap to ALS.
+**Fine-tune the image encoder instead of freezing it.** CLIP was trained on general
+internet images, not clothing photographed flat on a grey background, and fine-tuning it
+against purchase co-occurrence would likely sharpen the item vectors that both the content
+model and the two-tower depend on.
 
 ## Running it
 

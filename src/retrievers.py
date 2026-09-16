@@ -16,7 +16,8 @@ Measured recall on the test week, which is why each one exists:
                            per candidate of anything here
     AlsRetriever           collaborative signal
     ContentRetriever       reaches articles nobody has bought yet
-    TwoTowerRetriever      learned blend of the two
+    TwoTowerRetriever      learned blend of the two, and the strongest single
+                           model retriever by recall
 
 All six together reach far more than any one of them: the pool built from this
 list is what sets the ceiling the ranker works against.
@@ -220,17 +221,23 @@ class TwoTowerRetriever(Retriever):
         ranked = self._tower.rank(
             trained["user_tower"], trained["item_tower"], trained["item_features"], customers,
             trained["customer_index"], trained["article_ids"], trained["history_sum"],
-            trained["history_weight"], trained["static"], [], trained["device"],
+            trained["history_weight"], trained["static"], [], trained["device"], n=self.k,
         )
         return {customer: items[: self.k] for customer, items in ranked.items()}
 
 
 def default_retrievers() -> list[Retriever]:
-    return [
-        RecentBestsellers(),
-        PreviousPurchases(),
-        ColourVariants(),
-        AlsRetriever(),
-        ContentRetriever(),
-        TwoTowerRetriever(),
-    ]
+    """The pool the two-stage model uses.
+
+    Two retrievers, roughly 900 candidates per customer, reaching a recall
+    ceiling of about 0.45. Pooling all six at ~500 candidates reached 0.32, so
+    this is both smaller in code and larger in coverage: what sells right now
+    plus what the two-tower thinks this customer wants covers most of what the
+    others were contributing, and both scale to large k where the heuristics
+    run out of candidates.
+
+    The other four classes above are kept because they remain useful to pool
+    back in - ``ColourVariants`` and ``PreviousPurchases`` in particular are
+    high precision per candidate - but they are not in the default pool today.
+    """
+    return [RecentBestsellers(k=700), TwoTowerRetriever(k=700)]

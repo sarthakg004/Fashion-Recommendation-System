@@ -27,17 +27,27 @@ recognising itself, learning nothing. Each training pair therefore subtracts its
 own article from the customer's average first - exact, and cheaper than
 recomputing the average per sample.
 
-Everything below was chosen on the validation week, best epoch kept:
+Everything below was chosen on the validation week:
 
-    temperature 0.15   the single biggest lever. At 0.05 the softmax is so peaked
-                       that a handful of negatives dominate each step
-                       (val MAP@12 0.0129 -> 0.0157).
-    learned item vector   adds the collaborative signal content alone cannot carry
-                       (0.0139 -> 0.0156 at matched settings), but only at the
-                       lower learning rate; at 1e-3 it memorises instead
-                       (training loss 7.2 -> 5.1 while validation got worse).
+    temperature 0.15   at 0.05 the softmax is so peaked that a handful of
+                       negatives dominate each step (val MAP@12 0.0129 -> 0.0157).
+    learned item vector   adds the collaborative signal content alone cannot carry,
+                       but only at the lower learning rate; at 1e-3 it memorises
+                       instead (training loss 7.2 -> 5.1 while validation got worse).
     batch 4096         batch size sets how many in-batch negatives each step sees;
                        2048 and 16384 both scored lower.
+    logQ correction    in-batch negatives are drawn in proportion to popularity, so
+                       popular articles are punished for being popular. Subtracting
+                       log(item frequency) from the logits undoes that sampling
+                       bias and is worth about 8% (0.0156 -> 0.0168 at matched size).
+    1024/256 towers    the model was capacity-starved rather than overfitting.
+                       Averaged over three seeds, 1024/256 scores 0.01739 against
+                       0.01688 for 512/256, a gap about three times the run-to-run
+                       spread. Narrower still (128/64) was clearly worse, and more
+                       dropout hurt at every width tried.
+    early stopping     patience of 10 on the validation week, which settles between
+                       epochs 11 and 20; the old fixed 20-epoch schedule was cutting
+                       training off mid-improvement.
 
 Run it directly to train, score and append the row to results/metrics_comparison.csv.
 """
@@ -65,18 +75,46 @@ popularity = importlib.import_module("01_popularity")
 
 MODEL_NAME = "04_two_tower"
 N_RECOMMENDATIONS = max(KS)
-EMBED_DIM = 128
-HIDDEN_DIM = 256
+EMBED_DIM = 256
+HIDDEN_DIM = 1024
 BATCH_SIZE = 4096
-EPOCHS = 20
+EPOCHS = 80
+PATIENCE = 10
+RETRIEVER_EPOCHS = 16
 LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 1e-2
 USE_ITEM_EMBEDDING = True
+USE_LOGQ_CORRECTION = True
 TEMPERATURE = 0.15
 DROPOUT = 0.1
 CHUNK = 4096
 SEED = 42
+ARTIFACTS = Path(__file__).resolve().parent / "artifacts" / "two_tower"
 
 CUSTOMER_CATEGORICAL = ["club_member_status", "fashion_news_frequency"]
+
+
+_ITEM_FEATURES: tuple[list[int], np.ndarray] | None = None
+
+
+def item_feature_matrix() -> tuple[list[int], np.ndarray]:
+    """Catalog features for every article, built once per process.
+
+    These describe articles, not customers, so they are identical for every fit.
+    Rebuilding them per fit meant rerunning the metadata SVD five times in a
+    single two-stage run, which cost minutes and a couple of gigabytes.
+    """
+    global _ITEM_FEATURES
+    if _ITEM_FEATURES is None:
+        article_ids = content.catalog(load_transactions())
+        features = np.hstack(
+            [
+                (1 - content.IMAGE_WEIGHT) * content.metadata_features(article_ids),
+                content.IMAGE_WEIGHT * content.image_features(article_ids, content.IMAGE_ENCODER),
+            ]
+        ).astype(np.float32)
+        _ITEM_FEATURES = (article_ids, features)
+    return _ITEM_FEATURES
 
 
 class Tower(nn.Module):
@@ -97,10 +135,11 @@ class Tower(nn.Module):
 class ItemTower(nn.Module):
     """Content projection plus an optional learned per-article vector."""
 
-    def __init__(self, in_dim: int, n_items: int, use_item_embedding: bool = USE_ITEM_EMBEDDING):
+    def __init__(self, in_dim: int, n_items: int, use_item_embedding: bool = USE_ITEM_EMBEDDING,
+                 hidden: int = HIDDEN_DIM, out_dim: int = EMBED_DIM):
         super().__init__()
-        self.content = Tower(in_dim)
-        self.embedding = nn.Embedding(n_items, EMBED_DIM) if use_item_embedding else None
+        self.content = Tower(in_dim, hidden, out_dim)
+        self.embedding = nn.Embedding(n_items, out_dim) if use_item_embedding else None
         if self.embedding is not None:
             nn.init.zeros_(self.embedding.weight)
 
@@ -161,7 +200,14 @@ def user_inputs(history_sum, history_weight, static, rows, exclude_cols=None, ex
     return np.hstack([profile, static[rows]]).astype(np.float32)
 
 
-def rank(user_tower, item_tower, item_features, customers, customer_index, article_ids, history_sum, history_weight, static, fallback, device):
+def rank(user_tower, item_tower, item_features, customers, customer_index, article_ids, history_sum, history_weight,
+         static, fallback, device, n: int = N_RECOMMENDATIONS):
+    """Top ``n`` articles per customer.
+
+    ``n`` defaults to the largest k the metrics need, but a candidate retriever
+    asks for far more than that - the pool is judged on coverage, not on the
+    twelve it would have shown.
+    """
     user_tower.eval()
     item_tower.eval()
     with torch.inference_mode():
@@ -182,49 +228,57 @@ def rank(user_tower, item_tower, item_features, customers, customer_index, artic
             batch = rows[start : start + CHUNK]
             features = user_inputs(history_sum, history_weight, static, batch)
             user_vectors = user_tower(torch.from_numpy(features).to(device))
-            top = (user_vectors @ item_vectors.T).topk(N_RECOMMENDATIONS, dim=1).indices.cpu().numpy()
+            top = (user_vectors @ item_vectors.T).topk(min(n, len(article_ids)), dim=1).indices.cpu().numpy()
             for customer, row in zip(known[start : start + CHUNK], top):
                 predictions[customer] = [article_ids[j] for j in row]
 
     return {c: predictions.get(c, fallback) for c in customers}
 
 
-def train_model(verbose: bool = True, epochs: int = EPOCHS, learning_rate: float = LEARNING_RATE,
+def train_model(verbose: bool = True, epochs: int | None = None, learning_rate: float = LEARNING_RATE,
                 temperature: float = TEMPERATURE, use_item_embedding: bool = USE_ITEM_EMBEDDING,
                 batch_size: int = BATCH_SIZE, transactions: pl.DataFrame | None = None,
-                select_best: bool = True):
+                select_best: bool = True, use_logq: bool = USE_LOGQ_CORRECTION, patience: int = PATIENCE,
+                save_artifacts: bool = False, hidden_dim: int = HIDDEN_DIM, embed_dim: int = EMBED_DIM):
     """Train both towers.
 
     ``transactions`` overrides the training frame, which matters when this is used
     as a candidate retriever for an earlier week: the model must see only that
-    week's history, never the week it is nominating candidates for. With
-    ``select_best`` off the epoch is fixed rather than chosen on the validation
-    week, for the same reason - that week is in the future of an earlier origin.
+    week's history, never the week it is nominating candidates for.
+
+    ``select_best`` controls how training stops. With it on, the validation week
+    scores every epoch, training stops after ``patience`` epochs without
+    improvement, and the best weights are restored. With it off there is no
+    honest validation week available - it lies in the future of an earlier
+    origin - so training runs a fixed ``RETRIEVER_EPOCHS``, the count early
+    stopping settled on during tuning.
     """
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     train = load_transactions("train") if transactions is None else transactions
-    article_ids = content.catalog(load_transactions())
-    item_features = np.hstack(
-        [
-            (1 - content.IMAGE_WEIGHT) * content.metadata_features(article_ids),
-            content.IMAGE_WEIGHT * content.image_features(article_ids, content.IMAGE_ENCODER),
-        ]
-    ).astype(np.float32)
+    article_ids, item_features = item_feature_matrix()
 
     customers, customer_index, rows, cols, weights, history_sum, history_weight = build_training_data(train, article_ids, item_features)
     static = customer_features(customers)
 
-    user_tower = Tower(item_features.shape[1] + static.shape[1]).to(device)
-    item_tower = ItemTower(item_features.shape[1], len(article_ids), use_item_embedding).to(device)
-    optimizer = torch.optim.AdamW(list(user_tower.parameters()) + list(item_tower.parameters()), lr=learning_rate)
+    epochs = epochs if epochs is not None else (EPOCHS if select_best else RETRIEVER_EPOCHS)
+
+    user_tower = Tower(item_features.shape[1] + static.shape[1], hidden_dim, embed_dim).to(device)
+    item_tower = ItemTower(item_features.shape[1], len(article_ids), use_item_embedding, hidden_dim, embed_dim).to(device)
+    optimizer = torch.optim.AdamW(
+        list(user_tower.parameters()) + list(item_tower.parameters()), lr=learning_rate, weight_decay=WEIGHT_DECAY
+    )
+    schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     scaler = torch.amp.GradScaler(device, enabled=device == "cuda")
+
+    counts = np.bincount(cols, weights=weights, minlength=len(article_ids)).astype(np.float32)
+    log_q = torch.from_numpy(np.log(np.clip(counts / counts.sum(), 1e-9, None))).to(device)
 
     val_truth = purchases_by_customer(load_transactions("val")) if select_best else {}
     fallback = popularity.top_articles(train)
-    best_map, best_state = -1.0, None
+    best_map, best_state, waited, history = -1.0, None, 0, []
 
     for epoch in range(1, epochs + 1):
         user_tower.train()
@@ -244,37 +298,107 @@ def train_model(verbose: bool = True, epochs: int = EPOCHS, learning_rate: float
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device, dtype=torch.float16, enabled=device == "cuda"):
                 logits = (user_tower(users) @ item_tower(items, item_ids).T) / temperature
+                if use_logq:
+                    logits = logits - log_q[item_ids].unsqueeze(0)
                 loss = F.cross_entropy(logits, torch.arange(len(batch), device=device))
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss.item() * len(batch)
 
+        schedule.step()
+        epoch_loss = total_loss / len(order)
+
         if not select_best:
+            history.append({"epoch": epoch, "loss": epoch_loss, "val_map@12": None})
             if verbose:
-                print(f"  epoch {epoch:>2}  loss={total_loss / len(order):.4f}")
+                print(f"  epoch {epoch:>2}  loss={epoch_loss:.4f}")
             continue
 
         predictions = rank(user_tower, item_tower, item_features, val_truth, customer_index, article_ids, history_sum, history_weight, static, fallback, device)
         val_map = evaluate(predictions, val_truth)["map@12"]
-        if val_map > best_map:
-            best_map = val_map
+        history.append({"epoch": epoch, "loss": epoch_loss, "val_map@12": val_map})
+
+        improved = val_map > best_map
+        if improved:
+            best_map, waited = val_map, 0
             best_state = ({k: v.clone() for k, v in user_tower.state_dict().items()}, {k: v.clone() for k, v in item_tower.state_dict().items()})
+        else:
+            waited += 1
         if verbose:
-            print(f"  epoch {epoch:>2}  loss={total_loss / len(order):.4f}  val_map@12={val_map:.5f}{'  *' if val_map == best_map else ''}")
+            print(f"  epoch {epoch:>2}  loss={epoch_loss:.4f}  val_map@12={val_map:.5f}{'  *' if improved else ''}")
+        if waited >= patience:
+            if verbose:
+                print(f"  early stop: no gain for {patience} epochs, best was epoch {max(history, key=lambda h: h['val_map@12'] or -1)['epoch']}")
+            break
 
     if best_state is not None:
         user_tower.load_state_dict(best_state[0])
         item_tower.load_state_dict(best_state[1])
+    if save_artifacts:
+        write_artifacts(history)
+    if device == "cuda":
+        torch.cuda.empty_cache()
     return dict(
         user_tower=user_tower, item_tower=item_tower, item_features=item_features, article_ids=article_ids,
         customer_index=customer_index, history_sum=history_sum, history_weight=history_weight, static=static,
-        fallback=fallback, device=device, best_val_map=best_map if select_best else None,
+        fallback=fallback, device=device, best_val_map=best_map if select_best else None, history=history,
     )
 
 
+def write_artifacts(history: list[dict]) -> None:
+    """Save the training history and its curve next to the model.
+
+    The figure is built through the Figure API rather than pyplot, because
+    pyplot would need a backend and switching to a file-writing one changes it
+    for the whole process. Called from a notebook, that silently stops every
+    later plot from displaying.
+    """
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    frame = pl.DataFrame(history)
+    frame.write_parquet(ARTIFACTS / "history.parquet")
+
+    scored = frame.filter(pl.col("val_map@12").is_not_null())
+    fig = Figure(figsize=(8, 3.4))
+    FigureCanvasAgg(fig)
+    left = fig.add_subplot(111)
+    left.plot(frame["epoch"], frame["loss"], color="#4c1fb8", linewidth=1.6, label="training loss")
+    left.set_xlabel("epoch")
+    left.set_ylabel("training loss", color="#4c1fb8")
+    left.spines[["top"]].set_visible(False)
+
+    if scored.height:
+        right = left.twinx()
+        right.plot(scored["epoch"], scored["val_map@12"], color="#0f9d76", linewidth=1.6, label="val MAP@12")
+        best = scored.sort("val_map@12", descending=True).head(1)
+        right.scatter(best["epoch"], best["val_map@12"], color="#0f9d76", zorder=3)
+        right.annotate(f"best epoch {best['epoch'][0]}", (best["epoch"][0], best["val_map@12"][0]),
+                       textcoords="offset points", xytext=(6, -10), fontsize=8, color="#0f9d76")
+        right.set_ylabel("val MAP@12", color="#0f9d76")
+        right.spines[["top"]].set_visible(False)
+
+    left.set_title("Two-tower training", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(ARTIFACTS / "training_curve.png", dpi=150)
+
+
 def main() -> dict:
-    trained = train_model(transactions=load_fitting_data(), select_best=False)
+    """Tune on the validation week, then refit on train+val and score the test week.
+
+    The first pass fits on training data only and early-stops on the validation
+    week, which is what produces the saved training curve. The second refits on
+    everything before the test week for the epoch count the first pass chose,
+    because by then the validation week is training data and cannot referee
+    anything.
+    """
+    tuned = train_model(transactions=load_transactions("train"), select_best=True, save_artifacts=True)
+    chosen = max(tuned["history"], key=lambda h: h["val_map@12"] or -1)["epoch"]
+    print(f"{MODEL_NAME}: early stopping chose epoch {chosen} (val map@12={tuned['best_val_map']:.5f}), refitting on train+val")
+
+    trained = train_model(transactions=load_fitting_data(), select_best=False, epochs=chosen, verbose=False)
     ground_truth = purchases_by_customer(load_transactions("test"))
     predictions = rank(
         trained["user_tower"], trained["item_tower"], trained["item_features"], ground_truth, trained["customer_index"],
@@ -283,8 +407,7 @@ def main() -> dict:
 
     scores = evaluate(predictions, ground_truth)
     save_result(MODEL_NAME, scores)
-    chosen = trained["best_val_map"]
-    print(f"{MODEL_NAME}: " + (f"best val map@12={chosen:.5f}" if chosen is not None else f"fixed {EPOCHS} epochs, refitted on train+val"))
+    print(f"{MODEL_NAME}: artifacts in {ARTIFACTS.relative_to(ARTIFACTS.parents[2])}")
     for k in KS:
         print(f"  @{k:<4} " + "  ".join(f"{m}={scores[f'{m}@{k}']:.5f}" for m in ("precision", "recall", "hitrate", "ndcg", "map")))
     return scores

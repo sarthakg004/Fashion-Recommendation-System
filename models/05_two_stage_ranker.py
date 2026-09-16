@@ -46,13 +46,25 @@ conditions it was trained on. Nothing is refitted on the test data.
 The ceiling is still the pool: an article that no retriever nominated cannot be
 ranked back in, so the script reports the pool's oracle recall alongside the score.
 
+Memory is the constraint that shapes this file. Candidates are built and scored in
+batches of customers, negatives are dropped before the feature joins rather than
+after, and polars is held to a few worker threads, because one thread per core
+each with its own buffers is what makes a pool this size run out of room. Peak
+usage is a little over 2.5 GB regardless of how many candidates each retriever
+nominates.
+
 Run it directly to build, train, score and append the row to
 results/metrics_comparison.csv.
 """
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("POLARS_MAX_THREADS", "4")
+
 import datetime as dt
+import gc
 import sys
 from pathlib import Path
 
@@ -72,6 +84,7 @@ N_RECOMMENDATIONS = max(KS)
 MISSING_RANK = 9999
 LABEL_WEEKS = 4
 NEGATIVES_PER_CUSTOMER = 30
+CUSTOMER_BATCH = 300
 SEED = 42
 LGBM_PARAMS = dict(
     objective="lambdarank",
@@ -115,10 +128,13 @@ def candidate_frame(retriever: Retriever, customers: list[str]) -> pl.DataFrame:
 
 
 def build_pool(retrievers: list[Retriever], customers: list[str]) -> pl.DataFrame:
+    """Union of every retriever's nominations, carrying each one's rank."""
     pool = None
     for retriever in retrievers:
         frame = candidate_frame(retriever, customers)
         pool = frame if pool is None else pool.join(frame, on=["customer_id", "article_id"], how="full", coalesce=True)
+        del frame
+        gc.collect()
     return pool
 
 
@@ -202,6 +218,26 @@ def rank_pool(model: LGBMRanker, pool: pl.DataFrame, customers, features: list[s
     return complete
 
 
+def downsample(pool: pl.DataFrame, negatives_per_customer: int = NEGATIVES_PER_CUSTOMER) -> pl.DataFrame:
+    """Keep every positive and a few negatives per customer.
+
+    A full pool is a fraction of a percent positives, which is what the ranker
+    was drowning in: it scored worse the more capacity it was given. Keeping all
+    positives plus a sample of negatives, and dropping customers who have no
+    positive at all because they carry no ordering signal, cuts the training rows
+    by a large factor and scores better.
+    """
+    positives = pool.filter(pl.col("bought") == 1)
+    negatives = (
+        pool.filter((pl.col("bought") == 0) & pl.col("customer_id").is_in(positives["customer_id"].unique()))
+        .sample(fraction=1.0, shuffle=True, seed=SEED)
+        .with_columns(pl.int_range(pl.len()).over("customer_id").alias("draw"))
+        .filter(pl.col("draw") < negatives_per_customer)
+        .drop("draw")
+    )
+    return pl.concat([positives, negatives])
+
+
 def label_weeks(n_weeks: int = LABEL_WEEKS):
     """Rolling origin: each week paired with the history available before it."""
     transactions = load_transactions()
@@ -216,52 +252,44 @@ def label_weeks(n_weeks: int = LABEL_WEEKS):
         yield index, history, purchases_by_customer(week)
 
 
-def pool_for(history: pl.DataFrame, customers: list[str], retrievers: list[Retriever]) -> pl.DataFrame:
-    """Candidates plus features, all derived from one history frame."""
-    rank_columns = [f"rank_{r.name}" for r in retrievers]
-    bestsellers = retrievers[0].recommend(["_"])["_"][:N_RECOMMENDATIONS]
-    return add_features(
-        build_pool(retrievers, customers),
-        history,
-        article_statistics(history, bestsellers),
-        customer_statistics(history),
-        rank_columns,
-    )
-
-
-def downsample(pool: pl.DataFrame, negatives_per_customer: int = NEGATIVES_PER_CUSTOMER) -> pl.DataFrame:
-    """Keep every positive and a few negatives per customer.
-
-    A full pool is 0.17% positives, which is what the ranker was drowning in: it
-    scored worse the more capacity it was given. Keeping all positives plus a
-    sample of negatives, and dropping customers who have no positive at all
-    because they carry no ordering signal, cuts the training rows by 30x and
-    scores better (val-week MAP@12 0.0133 -> 0.0155).
-    """
-    positives = pool.filter(pl.col("bought") == 1)
-    negatives = (
-        pool.filter((pl.col("bought") == 0) & pl.col("customer_id").is_in(positives["customer_id"].unique()))
-        .sample(fraction=1.0, shuffle=True, seed=SEED)
-        .with_columns(pl.int_range(pl.len()).over("customer_id").alias("draw"))
-        .filter(pl.col("draw") < negatives_per_customer)
-        .drop("draw")
-    )
-    return pl.concat([positives, negatives])
-
-
 def build_training_pool(n_weeks: int = LABEL_WEEKS, verbose: bool = True) -> pl.DataFrame:
+    """Stack several labelled weeks, each built from its own history.
+
+    Two things keep this inside memory. Negatives are dropped before the feature
+    joins, because all but a few percent of a week's pool is thrown away and
+    joining statistics onto the full thing first is wasted work. And customers
+    are processed in batches, so peak memory depends on CUSTOMER_BATCH rather
+    than on how many candidates each retriever nominates.
+    """
     weeks = []
     for index, history, truth in label_weeks(n_weeks):
         retrievers = [r.fit(history) for r in default_retrievers()]
-        weekly = label(pool_for(history, list(truth), retrievers), truth).with_columns(
-            pl.lit(index, dtype=pl.Int32).alias("week")
-        )
-        sampled = downsample(weekly)
-        weeks.append(sampled)
+        rank_columns = [f"rank_{r.name}" for r in retrievers]
+        bestsellers = retrievers[0].recommend(["_"])["_"][:N_RECOMMENDATIONS]
+        articles, customers = article_statistics(history, bestsellers), customer_statistics(history)
+
+        batches, raw_pairs, positives = [], 0, 0
+        for batch in batched(list(truth), CUSTOMER_BATCH):
+            candidates = label(build_pool(retrievers, batch), truth)
+            raw_pairs += candidates.height
+            positives += int(candidates["bought"].sum())
+            batches.append(add_features(downsample(candidates), history, articles, customers, rank_columns))
+            del candidates
+            gc.collect()
+
+        weekly = pl.concat(batches).with_columns(pl.lit(index, dtype=pl.Int32).alias("week"))
+        weeks.append(weekly)
         if verbose:
-            print(f"  label week -{index}: {len(truth):,} customers, {weekly.height:,} pairs, "
-                  f"{int(weekly['bought'].sum()):,} positives -> {sampled.height:,} training rows")
+            print(f"  label week -{index}: {len(truth):,} customers, {raw_pairs:,} pairs, "
+                  f"{positives:,} positives -> {weekly.height:,} training rows")
+        del batches, retrievers
+        gc.collect()
     return pl.concat(weeks).sort("week", "customer_id")
+
+
+def batched(items: list, size: int):
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 def run(retrievers: list[Retriever] | None = None, n_weeks: int = LABEL_WEEKS, verbose: bool = True,
@@ -277,25 +305,38 @@ def run(retrievers: list[Retriever] | None = None, n_weeks: int = LABEL_WEEKS, v
         retriever.fit(fitting)
 
     features = feature_names(retrievers)
+    rank_columns = [f"rank_{r.name}" for r in retrievers]
     bestsellers = retrievers[0].recommend(["_"])["_"][:N_RECOMMENDATIONS]
-    test_pool = pool_for(fitting, list(test_truth), retrievers)
+    articles, customers = article_statistics(fitting, bestsellers), customer_statistics(fitting)
+    pool_rows = 0
 
     groups = train_pool.group_by("week", "customer_id", maintain_order=True).len()["len"].to_numpy()
     model = LGBMRanker(**LGBM_PARAMS)
     model.fit(train_pool.select(features).to_numpy(), train_pool["bought"].to_numpy(), group=groups)
 
-    predictions = rank_pool(model, test_pool, test_truth, features, bestsellers)
+    predictions, reachable = {}, []
+    for batch in batched(list(test_truth), CUSTOMER_BATCH):
+        pool = build_pool(retrievers, batch)
+        reachable.append(oracle_recall(pool, {c: test_truth[c] for c in batch}))
+        featured = add_features(pool, fitting, articles, customers, rank_columns)
+        predictions.update(rank_pool(model, featured, batch, features, bestsellers))
+        pool_rows += featured.height
+        del pool, featured
+        gc.collect()
+
+    ceiling = float(np.mean(reachable))
     scores = evaluate(predictions, test_truth)
     if save:
         save_result(MODEL_NAME, scores)
 
     return dict(
-        scores=scores, predictions=predictions, model=model, test_pool=test_pool, train_pool=train_pool,
-        ceiling=oracle_recall(test_pool, test_truth), bestsellers=bestsellers, retrievers=retrievers,
+        scores=scores, predictions=predictions, model=model, train_pool=train_pool, pool_rows=pool_rows,
+        ceiling=ceiling, bestsellers=bestsellers, retrievers=retrievers,
         recall_by_retriever=pl.DataFrame(
             [
                 {"retriever": r.name, "k": r.k,
-                 "ceiling": round(oracle_recall(candidate_frame(r, list(test_truth)), test_truth), 4)}
+                 "ceiling": round(np.mean([oracle_recall(candidate_frame(r, batch), {c: test_truth[c] for c in batch})
+                                           for batch in batched(list(test_truth), CUSTOMER_BATCH)]), 4)}
                 for r in retrievers
             ]
         ).sort("ceiling", descending=True),
@@ -305,9 +346,9 @@ def run(retrievers: list[Retriever] | None = None, n_weeks: int = LABEL_WEEKS, v
 
 def main() -> dict:
     result = run()
-    scores, pool = result["scores"], result["test_pool"]
-    print(f"{MODEL_NAME}: pool {pool.height:,} pairs for {scores['n_customers']:,} customers "
-          f"({pool.height / scores['n_customers']:.0f} candidates each)")
+    scores, pool_rows = result["scores"], result["pool_rows"]
+    print(f"{MODEL_NAME}: pool {pool_rows:,} pairs for {scores['n_customers']:,} customers "
+          f"({pool_rows / scores['n_customers']:.0f} candidates each)")
     print(f"  pool ceiling (oracle recall): {result['ceiling']:.4f}")
     print("  top features: " + ", ".join(f"{row[0]}={int(row[1])}" for row in result["importance"].head(5).iter_rows()))
     for k in KS:
