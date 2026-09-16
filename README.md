@@ -1,5 +1,10 @@
 # Aurora — H&M Fashion Recommender
 
+> Five recommenders built on the same data and scored the same way, from a popularity
+> baseline to a two-stage retrieval-and-ranking system.
+
+**Python** · **PyTorch** · **LightGBM** · **Polars** · **implicit** · **OpenCLIP** · **FastAPI** · **React**
+
 This project builds a fashion recommender five times over, starting from the dumbest
 thing that works and ending with a two-stage system of the kind that wins Kaggle
 competitions. Every version is scored the same way on the same held-out week, so the
@@ -8,6 +13,24 @@ each other.
 
 The point is not the score. The point is being able to see what each step adds, and
 where each one stops working.
+
+**Contents**
+
+1. [The problem](#the-problem)
+2. [The data](#the-data)
+3. [How I sampled it](#how-i-sampled-it)
+4. [Image embeddings](#image-embeddings)
+5. [How everything is measured](#how-everything-is-measured)
+6. [The five models](#the-five-models)
+7. [Results](#results)
+8. [What these numbers actually mean](#what-these-numbers-actually-mean)
+9. [How much should you trust these numbers?](#how-much-should-you-trust-these-numbers)
+10. [What I would do with more compute](#what-i-would-do-with-more-compute)
+11. [Running it](#running-it)
+12. [The web app](#the-web-app)
+13. [Layout](#layout)
+
+---
 
 ## The problem
 
@@ -24,6 +47,8 @@ is almost nothing to personalise on. And the catalog moves constantly: about an 
 the articles bought during the test week had never been sold before it, so a model that
 only knows what has already sold is blind to them.
 
+---
+
 ## The data
 
 The Kaggle release has three tables and a folder of images. `transactions_train.csv` is
@@ -38,6 +63,8 @@ Here is a random sample of the catalog, which is worth looking at before any mod
 because it explains why the photos turn out to be useful later:
 
 ![Random product images from the catalog](docs/images/catalog_grid.png)
+
+---
 
 ## How I sampled it
 
@@ -87,6 +114,8 @@ comparison stays fair.
 | validation | 2020-09-09 → 2020-09-15 | 15,184 | 4,383 | 5,537 |
 | test | 2020-09-16 → 2020-09-22 | 14,561 | 4,155 | 5,244 |
 
+---
+
 ## Image embeddings
 
 Before any model runs, `data/extract_image_embeddings.py` pushes every sampled article's
@@ -115,6 +144,8 @@ I used CLIP in the end, because for recommending a substitute item you want "the
 kind of thing", not "something that looks similar from across the room". Both files stay
 on disk, and switching between them is one constant.
 
+---
+
 ## How everything is measured
 
 `src/metrics.py` is written once and imported unchanged by all five models. Every model
@@ -137,6 +168,8 @@ strategy scores respectably. So the same module also reports what the lists look
 a whole — what share of the catalog they touch, how obvious the articles in them are, and
 how many distinct product types sit in a single list — and it can score any group of
 customers separately, which is how the cold and heavy buyers below are pulled apart.
+
+---
 
 ## The five models
 
@@ -381,10 +414,15 @@ ones on MAP@12 while scoring below them on recall@100. Somebody who bought forty
 is not easier to predict than somebody who bought three, because MAP divides by how much
 they bought: a heavy buyer has more purchases to find and twelve slots to find them in.
 
-#### What the recommendations look like
+#### How much of the catalog it actually uses
 
 Accuracy would not notice a model that had quietly learned to show everybody the same few
-hundred bestsellers, because on a catalog this skewed that strategy scores respectably.
+hundred bestsellers, because on a catalog this skewed that strategy scores respectably. So
+it is worth knowing that the top-twelve lists only ever touch **4% of the 28,086 articles**,
+about 1,140 of them. Widening that is a real problem, and no accuracy metric would raise it.
+
+<details>
+<summary>Novelty and diversity alongside it</summary>
 
 <!-- generated:catalog -->
 | measure | value |
@@ -394,9 +432,15 @@ hundred bestsellers, because on a catalog this skewed that strategy scores respe
 | intra-list diversity @12 | 0.4047 |
 <!-- /generated -->
 
-Coverage is the share of the 28,086 articles that appear in anybody's top twelve, novelty
-is how un-obvious those articles are in bits, and diversity is how many distinct product
-types sit inside one list of twelve.
+Novelty is how un-obvious the recommended articles are, in bits. Diversity is how many
+distinct product types sit inside a single list of twelve.
+
+</details>
+
+#### What it recommends
+
+Three test customers. Top row is what they actually bought that week, bottom row is the
+model's twelve, and green marks a hit.
 
 ![Two-stage recommendations](docs/images/demo_two_stage.png)
 
@@ -404,23 +448,25 @@ types sit inside one list of twelve.
 
 ![Two-stage recommendations, third customer](docs/images/demo_two_stage_3.png)
 
-Two results from this are more interesting than the score.
+#### Two things more interesting than the score
 
-**The bottleneck moved, twice.** The first version pooled only the four trained models,
-reached a ceiling of 0.085, and the ranker extracted 97% of it: ranking was saturated and
+**The bottleneck moved, twice.** The first version pooled only the four trained models and
+reached a ceiling of 0.085, of which the ranker extracted 97%: ranking was saturated and
 recall was the only lever worth pulling. Adding cheap heuristic retrievers lifted the
-ceiling to 0.32. Improving the two-tower and pooling it with recent bestsellers at a
-thousand candidates lifted it again to about 0.47.
+ceiling to 0.32, and improving the two-tower and pooling it with recent bestsellers lifted
+it again to about 0.47. The ranker now converts roughly a third of that.
 
-The ranker now converts roughly a third of that into recall@100. The last step makes the
-point plainly: the ceiling rose by half and MAP@12 moved about two percent. The right
-articles are in the pool and the ranker cannot yet tell which of them matter, so the next
-gain has to come from better features on the pairs rather than from more candidates.
+That last step makes the point plainly. The ceiling rose by half and MAP@12 moved about
+two percent, so the right articles are in the pool and the ranker cannot yet tell which of
+them matter. The next gain has to come from better features on the pairs, not more
+candidates.
 
 **The most useful features are not the model ranks.** Article purchase count, customer
 activity and how recently an article sold all outrank every retriever's opinion. The
 retriever ranks matter more as a committee — how many agreed, and how strongly — than as
 individual orderings.
+
+---
 
 ## Results
 
@@ -442,6 +488,8 @@ something during that week.
 <!-- generated:headline -->
 The two-stage system ends up at about 8.9 times the popularity floor on MAP@12 and 4.1 times its hit rate, and it wins on every single column. It also beats its own best retriever, ALS, by 28% — which is the thing a two-stage system has to do to justify existing.
 <!-- /generated -->
+
+---
 
 ## What these numbers actually mean
 
@@ -465,35 +513,27 @@ than guessed at:
 Re-running the identical configuration on the same test week gives MAP@12 of 0.02944, 0.02969, 0.02986, 0.03121. That is a standard deviation of 0.00079 across 4 runs, so a difference smaller than about 0.0016 is noise rather than a result. Every hyperparameter change tried in this project sat inside that, which is why the reported figure below is one draw from this range rather than a fixed property of the model.
 <!-- /generated -->
 
-## How solid are these numbers
+---
 
-The table above is one held-out week scored once. That is enough to separate five models
-that differ by large margins, and not enough to trust a small difference. I learned that
-the hard way on this project: two rounds of tuning produced changes that looked clearly
-good on the validation week and turned out to be worth nothing on the test week.
+## How much should you trust these numbers?
 
-So `src/validation.py` re-runs the whole two-stage pipeline over four held-out weeks and
-three seeds. Nothing is shared between runs. Each fold refits the retrievers, rebuilds its
-label weeks and retrains the ranker using only data from before its own evaluation week,
-because reusing any fitted object across folds would leak the week being scored.
+One week, scored once, is one draw. I checked it two ways, and the second exists only
+because the first had a flaw.
 
-Each fold moves both windows together, because they cannot be moved independently. If the
-model trained through mid-September and were then scored on a week in early September, it
-would have seen those purchases during training and the score would be meaningless. The
-evaluation week has to sit after everything the model learned from, so sliding it also
-slides the training cutoff.
+### Method 1: rolling-origin cross-validation
 
-| fold | fits on | training ends | evaluates |
-|---|---|---|---|
-| 0 | 367,862 rows | 2020-09-15 | 09-16 to 09-22 |
-| 1 | 352,678 rows | 2020-09-08 | 09-09 to 09-15 |
-| 2 | 336,710 rows | 2020-09-01 | 09-02 to 09-08 |
-| 3 | 319,159 rows | 2020-08-25 | 08-26 to 09-01 |
+Re-run the whole pipeline on four different weeks, three random seeds each. Twelve runs,
+nothing shared between them: every fold refits the retrievers, rebuilds its label weeks
+and retrains the ranker on only the data before its own week. Reusing anything fitted
+later would leak the answer being scored.
 
-One thing that is controlled: the gap between training and evaluation is exactly zero in
-every fold, since the fitting data always ends the day before the evaluation week begins.
-No fold is working from staler data than another, so the variation below is not a recency
-artefact.
+```
+fold 0   [════════ train ═══════════════]  [week]
+fold 1   [════════ train ═════════]  [week]
+fold 2   [════════ train ═══]  [week]
+fold 3   [════════ train ]  [week]
+         ↑ start is fixed        ↑ end slides back
+```
 
 <!-- generated:cv -->
 | fold | customers | seed 7 | seed 13 | seed 42 | mean |
@@ -503,47 +543,43 @@ artefact.
 | 2 | 4,602 | 0.02297 | 0.02344 | 0.02288 | 0.02309 |
 | 3 | 4,936 | 0.02384 | 0.02311 | 0.02315 | 0.02337 |
 
-| metric | mean | std across folds | std across seeds | min | max |
-|---|---|---|---|---|---|
-| map@12 | 0.026195 | 0.00345 | 0.000363 | 0.022876 | 0.029856 |
-| ndcg@12 | 0.040544 | 0.004446 | 0.000562 | 0.036226 | 0.045512 |
-| recall@100 | 0.168137 | 0.005597 | 0.001691 | 0.160931 | 0.175574 |
+Across all twelve runs the mean is **0.0262**, ranging from 0.0229 to 0.0299.
 <!-- /generated -->
 
 ![Cross-validation across four weeks and three seeds](docs/images/cross_validation.png)
 
-Two spreads are reported because they mean different things. The spread **across seeds**
-is the same week re-run with a different random draw, so it is this pipeline's own noise
-floor. The spread **across folds** is how much the score depends on which week you happened
-to test on. The second is about ten times the first, and that is the main thing this
-exercise found.
+Two spreads come out of this, and they mean different things:
 
-It is worth being blunt about what that implies. Every hyperparameter change I made in
-this project moved the score by less than the fold spread, and most by less than the seed
-spread. The gains that survived came from giving a model information it did not have
-before, never from tuning what it already had.
+| what changes | how much MAP@12 moves |
+|---|---|
+| the random seed, same week | **0.0004** |
+| the week, a different week | **0.0035** |
 
-The weeks themselves differ more than I expected. The two most recent weeks both score
-near 0.029 and the two before them near 0.023, and I could not pin that down to one cause.
-The share of evaluated customers with no purchase history moves only from 20.4% to 22.8%
-across the folds, which is far too small to account for it. The rate at which customers
-re-buy something they already own does drop in the weaker weeks, from about 2.96% to
-2.45%, and that is the single highest-precision signal the ranker has, but it moves in the
-right direction without being large enough to carry the whole gap. The pool's own ceiling
-also falls in the two weaker folds, so some of it is retrieval rather than ranking.
+**The week you test on matters about ten times more than the random seed.** Every
+hyperparameter change I made in this project moved the score by less than that, which is
+why I stopped tuning. The gains that survived came from giving a model information it did
+not have, never from adjusting what it already had.
 
-There is a confound in this design that I want to state rather than gloss over. The folds
-differ in two ways at once: which week they predict, and how much history they fit on,
-which falls from 367,862 rows to 319,159 across the four. So "that week was harder" and
-"that fold had 13% less data to learn from" cannot currently be told apart. The step shape
-of the results argues against data volume being the whole story, since a shrinking training
-set should produce a smooth decline rather than two high weeks followed by two low ones,
-but ruling an explanation out is not the same as proving the alternative.
+The four-week mean is **0.0262**, and the reported test week is the best of the four.
 
-The clean way to settle it is a sliding window rather than an expanding one: hold the
-number of weeks of history constant across folds so that only the evaluation week changes.
-Every fold then gets exactly 16 weeks, which is all fold 3 has, so training size varies by
-3% across folds instead of 15%.
+### Method 2: fixed-window cross-validation
+
+The first design has a flaw. Look at the diagram again: as the week slides back, the
+training block gets *shorter*, from 367,862 rows down to 319,159. So when a later fold
+scored worse, two explanations fit equally well — that week was harder, or that fold had
+less to learn from.
+
+The fix is to slide a fixed-length window instead of growing one. Every fold gets exactly
+16 weeks, which is what fold 3 already had, so training size varies by 3% instead of 15%
+and the week is essentially the only thing left changing.
+
+```
+fold 0         [══ 16 weeks ══]  [week]
+fold 1       [══ 16 weeks ══]  [week]
+fold 2     [══ 16 weeks ══]  [week]
+fold 3   [══ 16 weeks ══]  [week]
+         ↑ both ends move together
+```
 
 <!-- generated:window -->
 | fold | expanding history | fixed 16 weeks | change |
@@ -555,42 +591,46 @@ Every fold then gets exactly 16 weeks, which is all fold 3 has, so training size
 | **std across folds** | **0.00345** | **0.00385** |  |
 <!-- /generated -->
 
-Fold 3 is the control. It already had only 16 weeks, so it loses nothing and its two
-versions differ only by GPU non-determinism; it moves by 0.1%, which is what a correct
-implementation should look like.
+**The weeks genuinely differ.** Equalising the data did not shrink the spread; it went
+from 0.0035 to 0.0039. Data volume was never the explanation, so the four-week mean stands
+as the fair estimate.
 
-Two separate answers come out of this.
+**Older data is mildly harmful, which I did not expect.** The gain tracks how much history
+was cut. On a catalog that turns over weekly, May purchases describe clothes that are not
+on the shelves in September, and the model does better for not seeing them. This is worth
+about half of what going from nine ranker features to seventeen was worth, and that was the
+biggest deliberate improvement in the project. It comes from deleting data.
 
-**The fold spread is real and the weeks genuinely differ.** Equalising the training data
-did not shrink it. The standard deviation across folds went from 0.0035 to 0.0039, so the
-confound above resolves in favour of the weeks rather than the data volume, and the fair
-estimate of this model on an arbitrary week stands.
+**The last row is the control.** Fold 3 already had 16 weeks, so both versions feed it
+byte-identical data and it should not move at all. It moves 0.1%, which is the GPU
+non-determinism measured above. If it had moved meaningfully, the window code would be
+wrong and none of the other rows could be believed.
 
-**Older data is mildly harmful, which I did not expect.** The improvement tracks how much
-history was cut: three weeks removed is worth 4.3%, two weeks 1.7%, one week 2.1%, and
-zero weeks 0.1%. On a catalog that turns over weekly, May purchases describe an assortment
-that no longer exists, and the model scores better for not seeing them. For scale, 4.3% is
-half of what going from nine ranker features to seventeen was worth, and that was the
-largest deliberate improvement in this project.
+<details>
+<summary>Two explanations I tested and rejected</summary>
 
-The second finding is actionable and the pipeline does not currently use it, since every
-model fits on the whole 140-day window. It is left as a change for its own round rather
-than folded into the measurement that found it, because the honest version of that change
-means re-running all five models and re-tuning the window length itself.
+**The mix of cold customers.** Earlier folds have slightly more customers with no purchase
+history, and those score far worse, so that could inflate the gap. It does not: the cold
+share moves only from 20.4% to 22.8% across folds, worth about 0.0003 of a 0.0066 gap.
 
-One limit worth stating: a fixed window moves *which* weeks are in training as well as how
-many, so if the catalog shifts seasonally that is still in play. This is a better
-controlled experiment than the expanding one, not a perfectly controlled one.
+**The repeat-purchase rate.** Customers re-buying something they already own is the
+highest-precision signal the ranker has, and it does drop in the weaker weeks, from 2.96%
+to 2.45%. The direction is right and the magnitude is not: it moves too little to carry
+the gap on its own.
 
-The practical consequence is that the reported test week is the most favourable of the
-four, and the four-week mean of 0.0262 is a fairer estimate of what this model does on an
-arbitrary week than the 0.0298 in the table above.
+One limit I should state: a fixed window changes *which* weeks are in training as well as
+how many, so seasonal drift in the catalog is still in play. This is a better controlled
+experiment than the expanding one, not a perfectly controlled one.
 
-The headline table stays on the fixed test week rather than switching to that mean, because
-models 1 to 4 were scored on that week and re-running all of them for every fold would cost
-hours to sharpen a comparison that is already unambiguous. Since every model shares the
-week, the ranking between them is unaffected; what the cross-validation changes is how much
-precision the absolute number deserves.
+</details>
+
+The headline table stays on the fixed test week rather than switching to the four-week
+mean, because models 1 to 4 were scored on that week and re-running all of them per fold
+would cost hours to sharpen a comparison that is already unambiguous. Every model shares
+the week, so the ranking between them is unaffected. What the cross-validation changes is
+how much precision the absolute number deserves.
+
+---
 
 ## What I would do with more compute
 
@@ -619,6 +659,8 @@ ceiling from 0.085 to 0.32 and then to about 0.47, and it is still where the lar
 sits: half of what customers actually bought never reaches the ranker at all. Larger k per
 retriever, an item-item cosine kNN retriever, and candidates drawn from what similar
 customers bought are the next things to try.
+
+---
 
 ## Running it
 
@@ -652,6 +694,8 @@ above, and it is the best place to start reading.
 Everything here runs on a single RTX 4060 with 8 GB of VRAM. The longest single step is
 the image embedding extraction at about 90 seconds per encoder.
 
+---
+
 ## The web app
 
 There is a small React front end that serves the two-stage model's recommendations, so
@@ -681,6 +725,8 @@ flatter the model. It is sorted by how many hits the model got, best first. Sort
 randomly you would click through a dozen customers and see nothing highlighted at all,
 because the real hit rate is about 12% — the app says so in a footnote rather than
 letting the ordering imply otherwise.
+
+---
 
 ## Layout
 
