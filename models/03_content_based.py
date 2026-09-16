@@ -2,8 +2,8 @@
 
 ALS knows nothing about what an article is. If nobody has bought an item yet it
 has no vector, so it can never be recommended - and this catalog turns over
-constantly: 19% of the articles bought in the test week were never bought during
-training. Those are invisible to model 2 by construction.
+constantly: 639 of the articles bought in the test week, 12% of them, had never
+sold before that week. Those are invisible to model 2 by construction.
 
 This model describes items instead of counting them. Each article becomes a
 vector built from three sources:
@@ -44,7 +44,7 @@ from sklearn.preprocessing import normalize
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data_utils import load_articles, load_transactions, purchases_by_customer
+from src.data_utils import load_articles, load_fitting_data, load_transactions, purchases_by_customer
 from src.metrics import KS, evaluate, save_result
 
 MODEL_NAME = "03_content_based"
@@ -149,7 +149,7 @@ def recommend(profiles, item_blocks, weights, customers, customer_index, article
 
 
 def main(image_encoder: str = IMAGE_ENCODER, image_weight: float = IMAGE_WEIGHT, split: str = "test") -> dict:
-    train, held_out = load_transactions("train"), load_transactions(split)
+    train, held_out = (load_fitting_data() if split == "test" else load_transactions("train")), load_transactions(split)
     ground_truth = purchases_by_customer(held_out)
 
     article_ids = catalog(load_transactions())
@@ -167,7 +167,7 @@ def main(image_encoder: str = IMAGE_ENCODER, image_weight: float = IMAGE_WEIGHT,
 
     cold_start = set(article_ids) - set(train["article_id"].unique().to_list())
     surfaced = {a for items in predictions.values() for a in items[:12]} & cold_start
-    print(f"{MODEL_NAME}: {len(article_ids):,} candidate articles ({len(cold_start):,} never bought in train)")
+    print(f"{MODEL_NAME}: {len(article_ids):,} candidate articles ({len(cold_start):,} never sold before the test week)")
     print(f"  cold-start articles surfaced in a top-12: {len(surfaced):,}")
     for k in KS:
         print(f"  @{k:<4} " + "  ".join(f"{m}={scores[f'{m}@{k}']:.5f}" for m in ("precision", "recall", "hitrate", "ndcg", "map")))

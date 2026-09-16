@@ -57,7 +57,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.data_utils import SAMPLE, load_transactions, purchases_by_customer
+from src.data_utils import SAMPLE, load_fitting_data, load_transactions, purchases_by_customer
 from src.metrics import KS, evaluate, save_result
 
 content = importlib.import_module("03_content_based")
@@ -191,12 +191,21 @@ def rank(user_tower, item_tower, item_features, customers, customer_index, artic
 
 def train_model(verbose: bool = True, epochs: int = EPOCHS, learning_rate: float = LEARNING_RATE,
                 temperature: float = TEMPERATURE, use_item_embedding: bool = USE_ITEM_EMBEDDING,
-                batch_size: int = BATCH_SIZE):
+                batch_size: int = BATCH_SIZE, transactions: pl.DataFrame | None = None,
+                select_best: bool = True):
+    """Train both towers.
+
+    ``transactions`` overrides the training frame, which matters when this is used
+    as a candidate retriever for an earlier week: the model must see only that
+    week's history, never the week it is nominating candidates for. With
+    ``select_best`` off the epoch is fixed rather than chosen on the validation
+    week, for the same reason - that week is in the future of an earlier origin.
+    """
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    train = load_transactions("train")
+    train = load_transactions("train") if transactions is None else transactions
     article_ids = content.catalog(load_transactions())
     item_features = np.hstack(
         [
@@ -213,7 +222,7 @@ def train_model(verbose: bool = True, epochs: int = EPOCHS, learning_rate: float
     optimizer = torch.optim.AdamW(list(user_tower.parameters()) + list(item_tower.parameters()), lr=learning_rate)
     scaler = torch.amp.GradScaler(device, enabled=device == "cuda")
 
-    val_truth = purchases_by_customer(load_transactions("val"))
+    val_truth = purchases_by_customer(load_transactions("val")) if select_best else {}
     fallback = popularity.top_articles(train)
     best_map, best_state = -1.0, None
 
@@ -241,6 +250,11 @@ def train_model(verbose: bool = True, epochs: int = EPOCHS, learning_rate: float
             scaler.update()
             total_loss += loss.item() * len(batch)
 
+        if not select_best:
+            if verbose:
+                print(f"  epoch {epoch:>2}  loss={total_loss / len(order):.4f}")
+            continue
+
         predictions = rank(user_tower, item_tower, item_features, val_truth, customer_index, article_ids, history_sum, history_weight, static, fallback, device)
         val_map = evaluate(predictions, val_truth)["map@12"]
         if val_map > best_map:
@@ -249,17 +263,18 @@ def train_model(verbose: bool = True, epochs: int = EPOCHS, learning_rate: float
         if verbose:
             print(f"  epoch {epoch:>2}  loss={total_loss / len(order):.4f}  val_map@12={val_map:.5f}{'  *' if val_map == best_map else ''}")
 
-    user_tower.load_state_dict(best_state[0])
-    item_tower.load_state_dict(best_state[1])
+    if best_state is not None:
+        user_tower.load_state_dict(best_state[0])
+        item_tower.load_state_dict(best_state[1])
     return dict(
         user_tower=user_tower, item_tower=item_tower, item_features=item_features, article_ids=article_ids,
         customer_index=customer_index, history_sum=history_sum, history_weight=history_weight, static=static,
-        fallback=fallback, device=device, best_val_map=best_map,
+        fallback=fallback, device=device, best_val_map=best_map if select_best else None,
     )
 
 
 def main() -> dict:
-    trained = train_model()
+    trained = train_model(transactions=load_fitting_data(), select_best=False)
     ground_truth = purchases_by_customer(load_transactions("test"))
     predictions = rank(
         trained["user_tower"], trained["item_tower"], trained["item_features"], ground_truth, trained["customer_index"],
@@ -268,7 +283,8 @@ def main() -> dict:
 
     scores = evaluate(predictions, ground_truth)
     save_result(MODEL_NAME, scores)
-    print(f"{MODEL_NAME}: best val map@12={trained['best_val_map']:.5f}")
+    chosen = trained["best_val_map"]
+    print(f"{MODEL_NAME}: " + (f"best val map@12={chosen:.5f}" if chosen is not None else f"fixed {EPOCHS} epochs, refitted on train+val"))
     for k in KS:
         print(f"  @{k:<4} " + "  ".join(f"{m}={scores[f'{m}@{k}']:.5f}" for m in ("precision", "recall", "hitrate", "ndcg", "map")))
     return scores

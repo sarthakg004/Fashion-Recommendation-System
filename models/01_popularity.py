@@ -22,7 +22,7 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data_utils import load_transactions, purchases_by_customer
+from src.data_utils import load_fitting_data, load_transactions, purchases_by_customer
 from src.metrics import KS, evaluate, save_result
 
 MODEL_NAME = "01_popularity"
@@ -44,7 +44,7 @@ def recommend(customers, ranked: list[int]) -> dict[str, list[int]]:
 
 
 def main() -> dict:
-    train, test = load_transactions("train"), load_transactions("test")
+    train, test = load_fitting_data(), load_transactions("test")
     ground_truth = purchases_by_customer(test)
 
     ranked = top_articles(train)

@@ -7,28 +7,44 @@ The winning Kaggle solutions did not pick one - they pooled candidates from many
 cheap retrievers and trained a ranker to sort the pool. This is that idea at a
 readable scale.
 
-Stage one, recall: take the top RECALL_K articles from each of the four models
-and union them into one candidate set per customer. The pool is small enough to
-score exhaustively and much richer than any single model's list - a candidate that
-three models nominate is more interesting than one that a single model ranked
-first.
+Stage one, recall: every retriever in ``src/retrievers.py`` nominates its top
+candidates and the union becomes the candidate set. Three of the six are simple
+heuristics rather than models - what sold last week, what this customer already
+bought, and other colourways of it - and they matter more than the trained models
+do. A pool of the four models alone reached a recall ceiling of 0.085, and the ranker
+extracted 97% of it - ranking was saturated and recall was the binding constraint.
+Adding the three heuristics lifts the ceiling to about 0.32, of which the ranker
+now reaches roughly half. The constraint has moved from recall to ordering, which
+is why the next gain should come from richer features rather than more candidates.
 
 Stage two, ranking: describe every (customer, candidate) pair with a handful of
 features and train LightGBM's lambdarank objective on them.
 
-    where it came from   each model's rank for this pair, and how many of the four
+    where it came from   each retriever's rank for this pair, and how many of them
                          nominated it at all
     how popular it is    training purchase count and popularity rank
     how fresh it is      days since the article was last bought in training
     repurchase           how often this customer already bought this article, and
                          how active the customer is
 
-The ranker learns on the validation week - candidates generated from models fitted
-on train, labels taken from val - and is then applied unchanged to the test week.
-Nothing is refitted on the test data.
+The ranker learns from LABEL_WEEKS consecutive weeks, not one. Each training week
+is built with a rolling origin: retrievers are refitted on everything strictly
+before that week, asked for candidates, and labelled with what the customer
+actually bought during it. Refitting per week is the slow part of this script and
+it is not optional - reusing one fitted model across all the label weeks would let
+it nominate candidates using purchases from after the week it is being scored on.
 
-The ceiling is the pool: an article that no retriever nominated cannot be ranked
-back in, so the script reports the pool's oracle recall alongside the score.
+One week of labels was not enough. With the enlarged pool the ranker saw roughly
+13k positives against 519 candidates per customer, and every extra tree memorised
+that single week: more capacity and a binary objective both scored worse. Stacking
+several weeks is what lets the pool pay off.
+
+The most recent label week is the validation week, whose history is exactly the
+training frame used at test time, so the ranker is applied to test under the same
+conditions it was trained on. Nothing is refitted on the test data.
+
+The ceiling is still the pool: an article that no retriever nominated cannot be
+ranked back in, so the script reports the pool's oracle recall alongside the score.
 
 Run it directly to build, train, score and append the row to
 results/metrics_comparison.csv.
@@ -36,7 +52,7 @@ results/metrics_comparison.csv.
 
 from __future__ import annotations
 
-import importlib
+import datetime as dt
 import sys
 from pathlib import Path
 
@@ -47,18 +63,16 @@ from lightgbm import LGBMRanker
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.data_utils import load_transactions, purchases_by_customer
+from src.data_utils import load_fitting_data, load_transactions, purchases_by_customer
 from src.metrics import KS, evaluate, save_result
-
-popularity = importlib.import_module("01_popularity")
-als = importlib.import_module("02_collaborative_als")
-content = importlib.import_module("03_content_based")
-two_tower = importlib.import_module("04_two_tower")
+from src.retrievers import Retriever, default_retrievers
 
 MODEL_NAME = "05_two_stage_ranker"
 N_RECOMMENDATIONS = max(KS)
-RECALL_K = 50
-SOURCES = ("popularity", "als", "content", "tower")
+MISSING_RANK = 9999
+LABEL_WEEKS = 4
+NEGATIVES_PER_CUSTOMER = 30
+SEED = 42
 LGBM_PARAMS = dict(
     objective="lambdarank",
     n_estimators=300,
@@ -71,36 +85,41 @@ LGBM_PARAMS = dict(
     verbose=-1,
 )
 
+STATIC_FEATURES = [
+    "n_sources",
+    "best_rank",
+    "article_purchases",
+    "article_days_since_sold",
+    "popularity_rank",
+    "customer_purchases",
+    "times_bought_before",
+]
 
-def fit_retrievers(train: pl.DataFrame):
-    """Fit all four models on the training window once."""
-    bestsellers = popularity.top_articles(train)
 
-    matrix, als_items, als_index = als.build_matrix(train)
-    als_model, als_weighted = als.fit(matrix)
+def feature_names(retrievers: list[Retriever]) -> list[str]:
+    return [f"rank_{r.name}" for r in retrievers] + STATIC_FEATURES
 
-    article_ids = content.catalog(load_transactions())
-    blocks = [content.metadata_features(article_ids), content.image_features(article_ids, content.IMAGE_ENCODER)]
-    profiles, content_index = content.customer_profiles(train, article_ids, blocks)
 
-    trained = two_tower.train_model(verbose=False)
+def candidate_frame(retriever: Retriever, customers: list[str]) -> pl.DataFrame:
+    """One retriever's nominations as (customer_id, article_id, rank_<name>)."""
+    ranked = retriever.recommend(customers)
+    frame = pl.DataFrame(
+        {"customer_id": list(ranked), "article_id": [list(items) for items in ranked.values()]},
+        schema={"customer_id": pl.String, "article_id": pl.List(pl.Int64)},
+    )
+    return (
+        frame.explode("article_id")
+        .drop_nulls("article_id")
+        .with_columns((pl.col("article_id").cum_count().over("customer_id")).cast(pl.Int32).alias(f"rank_{retriever.name}"))
+    )
 
-    def recall(customers) -> dict[str, dict[str, list[int]]]:
-        customers = list(customers)
-        return {
-            "popularity": {c: bestsellers for c in customers},
-            "als": als.recommend(als_model, als_weighted, customers, als_items, als_index, bestsellers),
-            "content": content.recommend(
-                profiles, blocks, [1 - content.IMAGE_WEIGHT, content.IMAGE_WEIGHT], customers, content_index, article_ids, bestsellers
-            ),
-            "tower": two_tower.rank(
-                trained["user_tower"], trained["item_tower"], trained["item_features"], customers, trained["customer_index"],
-                trained["article_ids"], trained["history_sum"], trained["history_weight"], trained["static"],
-                trained["fallback"], trained["device"],
-            ),
-        }
 
-    return recall, bestsellers
+def build_pool(retrievers: list[Retriever], customers: list[str]) -> pl.DataFrame:
+    pool = None
+    for retriever in retrievers:
+        frame = candidate_frame(retriever, customers)
+        pool = frame if pool is None else pool.join(frame, on=["customer_id", "article_id"], how="full", coalesce=True)
+    return pool
 
 
 def article_statistics(train: pl.DataFrame, bestsellers: list[int]) -> pl.DataFrame:
@@ -117,60 +136,28 @@ def customer_statistics(train: pl.DataFrame) -> pl.DataFrame:
     return train.group_by("customer_id").agg(pl.len().alias("customer_purchases"))
 
 
-def build_pool(sources: dict[str, dict[str, list[int]]], customers: list[str]) -> pl.DataFrame:
-    """Union of each retriever's top-RECALL_K, with that retriever's rank per pair."""
-    pool = None
-    for name in SOURCES:
-        predictions = sources[name]
-        customer_column, article_column, rank_column = [], [], []
-        for customer in customers:
-            items = predictions[customer][:RECALL_K]
-            customer_column.extend([customer] * len(items))
-            article_column.extend(items)
-            rank_column.extend(range(1, len(items) + 1))
-        frame = pl.DataFrame(
-            {"customer_id": customer_column, "article_id": article_column, f"rank_{name}": rank_column},
-            schema={"customer_id": pl.String, "article_id": pl.Int64, f"rank_{name}": pl.Int32},
-        )
-        pool = frame if pool is None else pool.join(frame, on=["customer_id", "article_id"], how="full", coalesce=True)
-    return pool
-
-
-def add_features(pool: pl.DataFrame, train: pl.DataFrame, articles: pl.DataFrame, customers: pl.DataFrame) -> pl.DataFrame:
+def add_features(pool: pl.DataFrame, train: pl.DataFrame, articles: pl.DataFrame, customers: pl.DataFrame,
+                 rank_columns: list[str]) -> pl.DataFrame:
     repurchase = train.group_by("customer_id", "article_id").agg(pl.len().alias("times_bought_before"))
-    rank_columns = [f"rank_{name}" for name in SOURCES]
 
     return (
         pool.with_columns(
-            pl.sum_horizontal([pl.col(column).is_not_null().cast(pl.Int32) for column in rank_columns]).alias("n_sources")
+            pl.sum_horizontal([pl.col(column).is_not_null().cast(pl.Int32) for column in rank_columns]).alias("n_sources"),
+            pl.min_horizontal([pl.col(column) for column in rank_columns]).fill_null(MISSING_RANK).cast(pl.Int32).alias("best_rank"),
         )
-        .with_columns([pl.col(column).fill_null(RECALL_K + 1) for column in rank_columns])
+        .with_columns([pl.col(column).fill_null(MISSING_RANK) for column in rank_columns])
         .join(articles, on="article_id", how="left")
         .join(customers, on="customer_id", how="left")
         .join(repurchase, on=["customer_id", "article_id"], how="left")
         .with_columns(
             pl.col("article_purchases").fill_null(0),
             pl.col("article_days_since_sold").fill_null(999),
-            pl.col("popularity_rank").fill_null(len(SOURCES) * RECALL_K * 10),
+            pl.col("popularity_rank").fill_null(MISSING_RANK),
             pl.col("customer_purchases").fill_null(0),
             pl.col("times_bought_before").fill_null(0),
         )
         .sort("customer_id", "article_id")
     )
-
-
-FEATURES = [
-    "rank_popularity",
-    "rank_als",
-    "rank_content",
-    "rank_tower",
-    "n_sources",
-    "article_purchases",
-    "article_days_since_sold",
-    "popularity_rank",
-    "customer_purchases",
-    "times_bought_before",
-]
 
 
 def label(pool: pl.DataFrame, truth: dict[str, list[int]]) -> pl.DataFrame:
@@ -197,8 +184,8 @@ def oracle_recall(pool: pl.DataFrame, truth: dict[str, list[int]]) -> float:
     )
 
 
-def rank_pool(model: LGBMRanker, pool: pl.DataFrame, customers, fallback: list[int]) -> dict[str, list[int]]:
-    scored = pool.with_columns(pl.Series("score", model.predict(pool.select(FEATURES).to_numpy())))
+def rank_pool(model: LGBMRanker, pool: pl.DataFrame, customers, features: list[str], fallback: list[int]) -> dict[str, list[int]]:
+    scored = pool.with_columns(pl.Series("score", model.predict(pool.select(features).to_numpy())))
     ordered = (
         scored.sort(["customer_id", "score"], descending=[False, True])
         .group_by("customer_id", maintain_order=True)
@@ -215,31 +202,102 @@ def rank_pool(model: LGBMRanker, pool: pl.DataFrame, customers, fallback: list[i
     return complete
 
 
-def run() -> dict:
+def label_weeks(n_weeks: int = LABEL_WEEKS):
+    """Rolling origin: each week paired with the history available before it."""
+    transactions = load_transactions()
+    labelled = transactions.filter(pl.col("split") != "test")
+    last_day = labelled["t_dat"].max()
+
+    for index in range(n_weeks):
+        end = last_day - dt.timedelta(days=7 * index)
+        start = end - dt.timedelta(days=6)
+        week = labelled.filter((pl.col("t_dat") >= start) & (pl.col("t_dat") <= end))
+        history = labelled.filter(pl.col("t_dat") < start)
+        yield index, history, purchases_by_customer(week)
+
+
+def pool_for(history: pl.DataFrame, customers: list[str], retrievers: list[Retriever]) -> pl.DataFrame:
+    """Candidates plus features, all derived from one history frame."""
+    rank_columns = [f"rank_{r.name}" for r in retrievers]
+    bestsellers = retrievers[0].recommend(["_"])["_"][:N_RECOMMENDATIONS]
+    return add_features(
+        build_pool(retrievers, customers),
+        history,
+        article_statistics(history, bestsellers),
+        customer_statistics(history),
+        rank_columns,
+    )
+
+
+def downsample(pool: pl.DataFrame, negatives_per_customer: int = NEGATIVES_PER_CUSTOMER) -> pl.DataFrame:
+    """Keep every positive and a few negatives per customer.
+
+    A full pool is 0.17% positives, which is what the ranker was drowning in: it
+    scored worse the more capacity it was given. Keeping all positives plus a
+    sample of negatives, and dropping customers who have no positive at all
+    because they carry no ordering signal, cuts the training rows by 30x and
+    scores better (val-week MAP@12 0.0133 -> 0.0155).
+    """
+    positives = pool.filter(pl.col("bought") == 1)
+    negatives = (
+        pool.filter((pl.col("bought") == 0) & pl.col("customer_id").is_in(positives["customer_id"].unique()))
+        .sample(fraction=1.0, shuffle=True, seed=SEED)
+        .with_columns(pl.int_range(pl.len()).over("customer_id").alias("draw"))
+        .filter(pl.col("draw") < negatives_per_customer)
+        .drop("draw")
+    )
+    return pl.concat([positives, negatives])
+
+
+def build_training_pool(n_weeks: int = LABEL_WEEKS, verbose: bool = True) -> pl.DataFrame:
+    weeks = []
+    for index, history, truth in label_weeks(n_weeks):
+        retrievers = [r.fit(history) for r in default_retrievers()]
+        weekly = label(pool_for(history, list(truth), retrievers), truth).with_columns(
+            pl.lit(index, dtype=pl.Int32).alias("week")
+        )
+        sampled = downsample(weekly)
+        weeks.append(sampled)
+        if verbose:
+            print(f"  label week -{index}: {len(truth):,} customers, {weekly.height:,} pairs, "
+                  f"{int(weekly['bought'].sum()):,} positives -> {sampled.height:,} training rows")
+    return pl.concat(weeks).sort("week", "customer_id")
+
+
+def run(retrievers: list[Retriever] | None = None, n_weeks: int = LABEL_WEEKS, verbose: bool = True) -> dict:
     """Fit both stages and return everything the notebook wants to look at."""
-    train = load_transactions("train")
-    val_truth = purchases_by_customer(load_transactions("val"))
+    retrievers = retrievers or default_retrievers()
+    fitting = load_fitting_data()
     test_truth = purchases_by_customer(load_transactions("test"))
 
-    recall, bestsellers = fit_retrievers(train)
-    articles = article_statistics(train, bestsellers)
-    customers = customer_statistics(train)
+    train_pool = build_training_pool(n_weeks, verbose)
 
-    train_pool = label(add_features(build_pool(recall(val_truth), list(val_truth)), train, articles, customers), val_truth)
-    test_pool = add_features(build_pool(recall(test_truth), list(test_truth)), train, articles, customers)
+    for retriever in retrievers:
+        retriever.fit(fitting)
 
-    groups = train_pool.group_by("customer_id", maintain_order=True).len()["len"].to_numpy()
+    features = feature_names(retrievers)
+    bestsellers = retrievers[0].recommend(["_"])["_"][:N_RECOMMENDATIONS]
+    test_pool = pool_for(fitting, list(test_truth), retrievers)
+
+    groups = train_pool.group_by("week", "customer_id", maintain_order=True).len()["len"].to_numpy()
     model = LGBMRanker(**LGBM_PARAMS)
-    model.fit(train_pool.select(FEATURES).to_numpy(), train_pool["bought"].to_numpy(), group=groups)
+    model.fit(train_pool.select(features).to_numpy(), train_pool["bought"].to_numpy(), group=groups)
 
-    predictions = rank_pool(model, test_pool, test_truth, bestsellers)
+    predictions = rank_pool(model, test_pool, test_truth, features, bestsellers)
     scores = evaluate(predictions, test_truth)
     save_result(MODEL_NAME, scores)
 
     return dict(
         scores=scores, predictions=predictions, model=model, test_pool=test_pool, train_pool=train_pool,
-        ceiling=oracle_recall(test_pool, test_truth), bestsellers=bestsellers,
-        importance=pl.DataFrame({"feature": FEATURES, "gain": model.feature_importances_}).sort("gain", descending=True),
+        ceiling=oracle_recall(test_pool, test_truth), bestsellers=bestsellers, retrievers=retrievers,
+        recall_by_retriever=pl.DataFrame(
+            [
+                {"retriever": r.name, "k": r.k,
+                 "ceiling": round(oracle_recall(candidate_frame(r, list(test_truth)), test_truth), 4)}
+                for r in retrievers
+            ]
+        ).sort("ceiling", descending=True),
+        importance=pl.DataFrame({"feature": features, "gain": model.feature_importances_}).sort("gain", descending=True),
     )
 
 

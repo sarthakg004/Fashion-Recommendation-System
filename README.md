@@ -20,9 +20,9 @@ they looked at and passed on, and I can't tell a lukewarm purchase from an enthu
 one.
 
 Two things make it harder than it first looks. Most customers buy very little, so there
-is almost nothing to personalise on. And the catalog moves constantly: about a fifth of
-the articles bought during the test week had never been bought during training, so a
-model that only knows what has sold before is blind to them.
+is almost nothing to personalise on. And the catalog moves constantly: about an eighth of
+the articles bought during the test week had never been sold before it, so a model that
+only knows what has already sold is blind to them.
 
 ## The data
 
@@ -67,6 +67,17 @@ The split follows the competition setup. The last week of the window is the test
 the week before it is validation, and everything earlier is training. Splitting by time
 rather than at random is the only honest option here, because recommending next week's
 purchases from next week's data is not a problem anyone has.
+
+One more rule about how that split is used, and it turned out to matter more than any
+model choice: **every hyperparameter is picked on the validation week, and then every
+model is refitted on train and validation together before it predicts the test week.**
+That is what a weekly production retrain does. Fitted on training data alone, a model's
+view of the world stops a week before the week it is predicting, and that week is
+expensive: only 2.0% of test purchases are repeats of something the customer bought in
+training, against 3.9% of something they bought in training or validation, and test
+recall of the last-7-day bestseller list falls from 0.223 to 0.178. Adding that one week
+back roughly doubled four of the five models. All five use the same rule, so the
+comparison stays fair.
 
 ![Weekly purchase volume with the sampled window shaded](docs/images/weekly_volume.png)
 
@@ -137,8 +148,18 @@ knitwear, and the model offered them leggings, socks, underwear and a red bikini
 ![Popularity recommendations](docs/images/demo_popularity.png)
 
 The top row is what the customer actually bought during the test week; the bottom row is
-what the model recommended. That layout is repeated for every model below, always for
-the same customer, so you can compare them.
+what the model recommended, with hits outlined in green. That layout repeats for every
+model below, always for the same customer, so you can read the progression straight down
+the page: this customer gets nothing from popularity, two hits once ALS arrives, and
+three from the two-stage system, which works out that they buy jeans.
+
+A word on that customer. The notebook shows three of them, and they were picked on
+purpose — of the roughly 1,700 test customers who bought between three and twelve
+articles, 93 have a hit count that never drops as the models improve, and these are
+among them. They are not typical: most customers get zero hits from every model, which
+is what a hit rate of 12% at k=12 means. The comparison table further down is the
+unbiased view, and these pictures are here to show what the models are *doing*, not how
+often they succeed.
 
 ### 2. Collaborative filtering (ALS)
 
@@ -189,13 +210,13 @@ Because a vector comes from the article's own attributes, an article that nobody
 ever bought still has one.
 
 The clearest way to see this is to score both models against **only** the cold-start
-purchases, meaning test-week buys of articles that were never bought during training.
-There were 1,562 such customers:
+purchases, meaning test-week buys of the 639 articles that had never sold before that
+week. 893 customers bought at least one:
 
 | model | recall@12 | recall@100 | hit rate@100 |
 |---|---|---|---|
 | ALS | 0.0 | 0.0 | 0.0 |
-| content-based | 0.0071 | 0.0296 | 0.0455 |
+| content-based | 0.0065 | 0.0291 | 0.0370 |
 
 ALS scores exactly zero, and not because of rounding. Those articles are not in its
 matrix, so the score is structurally zero. That is the whole argument for this model.
@@ -238,46 +259,71 @@ falling while validation got worse. Even properly tuned it does not catch ALS. W
 retriever, and matrix factorisation is very hard to beat at that size. That is a real
 finding rather than a bug to tune away.
 
-It still earns its place, because its recall@100 is level with ALS even though its
-MAP@12 is lower. In other words it finds the right articles and orders them worse —
-which is exactly the division of labour the last model assumes.
+![Two-tower recommendations](docs/images/demo_two_tower.png)
+
+It still earns its place in the candidate pool. Its recall@100 (0.081) beats the
+content model's (0.073) even though its MAP@12 is lower than both, so it finds articles
+the others miss and simply orders them worse — which is exactly the division of labour
+the last model assumes.
 
 ### 5. Two-stage: multi-recall plus a LightGBM ranker
 
 Each of the four models is wrong in its own way. Popularity ignores the person, ALS
 ignores the item, content ignores co-purchase, and the two-tower orders things poorly.
 The solutions that won this competition did not pick one of these — they pooled
-candidates from several cheap retrievers and trained a ranker to sort the pool. This is
-that idea at a size you can read in one sitting.
+candidates from several cheap retrievers and trained a ranker to sort the pool.
 
-**Stage one** takes the top 50 from each of the four models and unions them, which comes
-to about 147 candidates per customer. That is small enough to score every pair
-exhaustively and much richer than any single model's list.
+**Stage one** lives in `src/retrievers.py`: a `Retriever` base class with six
+implementations. Three of them wrap models 2 to 4. The other three are heuristics that
+cost almost nothing, and they matter more than the models do:
 
-**Stage two** describes every (customer, candidate) pair with ten features and trains
-LightGBM's `lambdarank` on them. The features are each model's rank for that pair, how
-many of the four nominated it at all, the article's training purchase count and
-popularity rank, how many days since it last sold, how many times this customer already
-bought it, and how active the customer is.
+- `RecentBestsellers` — what sold most in the last seven days. On its own, the top 300
+  of this list reaches a recall of 0.178 on the test week, which is more than the entire
+  four-model pool managed before it was added.
+- `PreviousPurchases` — the customer's own articles, most recent first. About eight
+  candidates per customer, and the highest precision per candidate of anything here.
+- `ColourVariants` — other colourways of garments they already bought. H&M gives every
+  colourway of a garment the same `product_code`, so this is a single join.
 
-The ranker learns on the **validation** week — candidates from models fitted on training
-data, labels from validation — and is then applied unchanged to the test week. Nothing
-is refitted on test data.
+**Stage two** describes every (customer, candidate) pair with thirteen features and
+trains LightGBM's `lambdarank` on them: each retriever's rank for that pair, how many of
+the six nominated it, the best rank any of them gave it, the article's purchase count,
+popularity rank and days since it last sold, how often this customer already bought it,
+and how active they are.
+
+Two details decide whether this works at all, and I found both the hard way.
+
+**Labels come from four weeks, not one.** Each training week uses a rolling origin:
+retrievers are refitted on data strictly before that week, asked for candidates, then
+labelled with what was actually bought during it. Refitting per week is the slow part of
+the script and it is not optional. My first attempt reused one fitted model across all
+the label weeks, which let the two-tower nominate candidates it had been trained on, and
+the weeks inside training showed three times the positives of the validation week. The
+ranker learned that those candidates were excellent, which is false at prediction time,
+and the score got worse.
+
+**Negatives are downsampled.** A full pool is 0.17% positives, and the ranker was
+drowning in it — more trees made it score worse, and switching to a binary objective did
+not help either. Keeping every positive plus thirty negatives per customer, and dropping
+customers with no positive at all, cuts the training rows thirtyfold and scores better.
+The ratio was chosen on the validation week, where anything from ten to three hundred
+lands within 1.5% of the same score.
 
 ![Two-stage recommendations](docs/images/demo_two_stage.png)
 
 Two results from this are more interesting than the score.
 
-**The ranking stage is nearly saturated.** A perfect ranker on this candidate pool would
-reach recall@100 of about 0.085, and this one reaches 0.082 — it extracts roughly 97% of
-what the pool makes reachable. Almost everything still being missed is recall, meaning
-articles that no retriever nominated in the first place, not bad ordering. A bigger
-candidate pool would help; a cleverer ranker would not.
+**The bottleneck moved.** An earlier version pooled only the four trained models and
+reached a recall ceiling of 0.085 — and the ranker extracted 97% of it. Ranking was
+saturated and recall was the constraint, so adding the heuristic retrievers was the
+obvious fix. The ceiling is now about 0.32, and the ranker reaches roughly half of it.
+Recall is no longer what limits this system; ordering is. That points at richer ranker
+features rather than more candidates.
 
-**The most useful features are not the model ranks.** Customer activity, article
-purchase count and how recently an article sold all outrank every retriever's opinion.
-The retriever ranks matter more as a committee — how many models agreed on a candidate —
-than as individual orderings.
+**The most useful features are not the model ranks.** Article purchase count, customer
+activity and how recently an article sold all outrank every retriever's opinion. The
+retriever ranks matter more as a committee — how many agreed, and how strongly — than as
+individual orderings.
 
 ## Results
 
@@ -286,16 +332,18 @@ something during that week.
 
 | model | P@12 | R@12 | Hit@12 | NDCG@12 | MAP@12 | P@50 | R@50 | Hit@50 | NDCG@50 | MAP@50 | P@100 | R@100 | Hit@100 | NDCG@100 | MAP@100 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 01 popularity | 0.00231 | 0.00902 | 0.02599 | 0.00575 | 0.00280 | 0.00137 | 0.02278 | 0.06185 | 0.00935 | 0.00326 | 0.00119 | 0.03796 | 0.10181 | 0.01273 | 0.00349 |
-| 02 collaborative ALS | 0.00562 | 0.02827 | 0.05776 | 0.01905 | 0.01233 | 0.00250 | 0.04831 | 0.10132 | 0.02445 | 0.01320 | 0.00171 | 0.06230 | 0.13285 | 0.02755 | 0.01344 |
-| 03 content-based | 0.00403 | 0.02053 | 0.04284 | 0.01398 | 0.00910 | 0.00208 | 0.04034 | 0.08375 | 0.01923 | 0.00996 | 0.00153 | 0.05591 | 0.11625 | 0.02267 | 0.01023 |
-| 04 two-tower | 0.00405 | 0.01937 | 0.04188 | 0.01232 | 0.00726 | 0.00218 | 0.04239 | 0.08785 | 0.01838 | 0.00827 | 0.00165 | 0.05981 | 0.12274 | 0.02222 | 0.00859 |
-| **05 two-stage ranker** | **0.00650** | **0.03329** | **0.07100** | **0.02227** | **0.01431** | **0.00326** | **0.06175** | **0.13045** | **0.03022** | **0.01564** | **0.00225** | **0.08220** | **0.17040** | **0.03467** | **0.01601** |
+| 01 popularity | 0.00283 | 0.01146 | 0.03201 | 0.00715 | 0.00350 | 0.00142 | 0.02345 | 0.06426 | 0.01045 | 0.00396 | 0.00126 | 0.04052 | 0.10686 | 0.01427 | 0.00424 |
+| 02 collaborative ALS | 0.00959 | 0.05196 | 0.09338 | 0.03547 | 0.02434 | 0.00375 | 0.07603 | 0.14320 | 0.04222 | 0.02555 | 0.00238 | 0.09462 | 0.17786 | 0.04611 | 0.02587 |
+| 03 content-based | 0.00590 | 0.03319 | 0.06065 | 0.02492 | 0.01833 | 0.00256 | 0.05383 | 0.10181 | 0.03053 | 0.01934 | 0.00185 | 0.07272 | 0.14176 | 0.03465 | 0.01967 |
+| 04 two-tower | 0.00620 | 0.03306 | 0.06330 | 0.02271 | 0.01524 | 0.00288 | 0.05948 | 0.11047 | 0.02973 | 0.01648 | 0.00205 | 0.08051 | 0.14922 | 0.03424 | 0.01688 |
+| **05 two-stage ranker** | **0.01187** | **0.06099** | **0.11817** | **0.04183** | **0.02830** | **0.00577** | **0.11286** | **0.22383** | **0.05599** | **0.03075** | **0.00423** | **0.15707** | **0.30975** | **0.06556** | **0.03153** |
 
 ![Final comparison](docs/images/comparison_chart.png)
 
-The two-stage system ends up at about five times the popularity floor on MAP@12 and
-nearly three times its hit rate, and it wins on every single column.
+The two-stage system ends up at about eight times the popularity floor on MAP@12 and
+nearly four times its hit rate, and it wins on every single column. It also beats its own
+best retriever, ALS, by 16% — which is the thing a two-stage system has to do to justify
+existing.
 
 ## What these numbers actually mean
 
@@ -304,10 +352,10 @@ They are small, and they are supposed to be. The team that won this competition 
 multi-strategy recall ensemble. Anyone quoting a much higher number on this task is
 usually measuring something easier.
 
-It helps to think about what MAP@12 of 0.014 represents. A typical customer bought two
+It helps to think about what MAP@12 of 0.028 represents. A typical customer bought two
 or three things during the test week, out of a catalog of 28,000 articles, and about a
 fifth of what they bought had never been sold before. Getting one of those twelve slots
-right about 7% of the time is not a broken model — it is a genuinely hard prediction.
+right about 12% of the time is not a broken model — it is a genuinely hard prediction.
 
 One caveat on reproducibility. The sampling, ALS and content-based stages are fully
 deterministic and give identical numbers every run. Two-tower training is not, because
@@ -318,12 +366,13 @@ carries into the two-stage model through the candidate pool.
 
 These are things I deliberately did not do, not things I ran out of time for.
 
-**Widen the candidate pool.** This is the highest-value change, and the pool ceiling
-measurement says so directly: the ranker is already extracting 97% of the recall its
-candidates allow, so the gain has to come from better candidates. Taking the top 200
-from each retriever instead of 50, and adding cheap rule-based retrievers like "the same
-product in a different colour" or "what this customer bought last month", would lift the
-ceiling the ranker is working against.
+**Give the ranker more features.** This is now the highest-value change, and the ceiling
+measurement says so: the pool makes a recall of 0.32 reachable and the ranker gets about
+half of it, so the gain has to come from better ordering rather than more candidates.
+Thirteen features is a deliberate limit; the winning solutions used hundreds. Price
+relative to what this customer usually spends, how a product is selling week over week,
+sales channel preference, age-group affinity per article — each is small on its own and
+they add up.
 
 **Fine-tune the image encoder instead of freezing it.** CLIP was trained on general
 internet images, not on clothing photographed flat on a grey background. Fine-tuning it
@@ -336,10 +385,9 @@ recency weight. What they bought in order carries more information than that —
 bought last week changes what makes sense this week in a way a weighted average cannot
 express. A small transformer over the purchase sequence is the standard answer.
 
-**Give the ranker more features.** Ten features is a deliberate limit. The winning
-solutions used hundreds: price relative to the customer's usual spend, how a product is
-selling week over week, channel preferences, age-group affinity per article. Each is
-small on its own and they add up.
+**Push the candidate pool further.** Widening recall was worth a lot once, taking the
+ceiling from 0.085 to 0.32, and there is more left: larger k per retriever, an item-item
+cosine kNN retriever, and candidates drawn from what similar customers bought.
 
 **Correct the two-tower's negative sampling.** In-batch negatives are biased towards
 popular items, since popular articles appear as negatives more often. The standard logQ
@@ -367,7 +415,7 @@ python 01_popularity.py
 python 02_collaborative_als.py
 python 03_content_based.py
 python 04_two_tower.py
-python 05_two_stage_ranker.py
+python 05_two_stage_ranker.py            # about 6 minutes, refits per label week
 ```
 
 Each model prints its own scores and appends a row to `results/metrics_comparison.csv`.
@@ -386,8 +434,9 @@ data/
   image_embeddings_clip.parquet      cached CLIP vectors
   image_embeddings_resnet18.parquet  cached ResNet-18 vectors
 src/
-  data_utils.py                      shared loading
+  data_utils.py                      shared loading, and the refit-on-train+val rule
   metrics.py                         precision, recall, hit rate, NDCG, MAP
+  retrievers.py                      Retriever base class and the six candidate sources
 models/
   01_popularity.py
   02_collaborative_als.py

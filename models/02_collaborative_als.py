@@ -50,7 +50,7 @@ from threadpoolctl import threadpool_limits
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data_utils import load_transactions, purchases_by_customer
+from src.data_utils import load_fitting_data, load_transactions, purchases_by_customer
 from src.metrics import KS, evaluate, save_result
 
 MODEL_NAME = "02_collaborative_als"
@@ -112,7 +112,7 @@ def recommend(model, weighted, customers, items, user_index, fallback) -> dict[s
 
 
 def main() -> dict:
-    train, test = load_transactions("train"), load_transactions("test")
+    train, test = load_fitting_data(), load_transactions("test")
     ground_truth = purchases_by_customer(test)
 
     matrix, items, user_index = build_matrix(train)

@@ -23,6 +23,22 @@ def load_transactions(split: str | None = None) -> pl.DataFrame:
     return transactions if split is None else transactions.filter(pl.col("split") == split)
 
 
+def load_fitting_data() -> pl.DataFrame:
+    """Everything a model may learn from before predicting the test week.
+
+    Hyperparameters are chosen on the validation week, and then every model is
+    refitted on train *and* val before it predicts test, which is what a weekly
+    production retrain does. It matters more than it sounds: fitted on train
+    alone, a model's view of the catalog stops a week before the week it is
+    predicting, which halves the repurchase signal (2.0% of test purchases are
+    repeats of a train article, 3.9% of a train-or-val one) and dates the
+    bestseller list (test recall of the last-7-day top 300 goes 0.178 -> 0.223).
+
+    All five models use this, so the comparison stays like for like.
+    """
+    return load_transactions().filter(pl.col("split") != "test")
+
+
 def load_articles() -> pl.DataFrame:
     return pl.read_parquet(SAMPLE / "articles.parquet")
 
