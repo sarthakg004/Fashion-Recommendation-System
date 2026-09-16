@@ -131,6 +131,13 @@ article would otherwise get credit for the same hit twice.
 Each model appends one row to `results/metrics_comparison.csv`, which is where the final
 table comes from.
 
+Accuracy on its own would not notice a recommender that has quietly learned to show
+everybody the same few hundred bestsellers, because on a catalog this skewed that
+strategy scores respectably. So the same module also reports what the lists look like as
+a whole — what share of the catalog they touch, how obvious the articles in them are, and
+how many distinct product types sit in a single list — and it can score any group of
+customers separately, which is how the cold and heavy buyers below are pulled apart.
+
 ## The five models
 
 ### 1. Popularity
@@ -325,14 +332,77 @@ the weeks inside training showed three times the positives of the validation wee
 ranker learned that those candidates were excellent, which is false at prediction time,
 and the score got worse.
 
-**Negatives are downsampled.** A full pool is 0.17% positives, and the ranker was
+**Negatives are downsampled.** A full pool is 0.13% positives, and the ranker was
 drowning in it — more trees made it score worse, and switching to a binary objective did
-not help either. Keeping every positive plus thirty negatives per customer, and dropping
-customers with no positive at all, cuts the training rows thirtyfold and scores better.
-The ratio was chosen on the validation week, where anything from ten to three hundred
-lands within 1.5% of the same score.
+not help either. Keeping every positive plus sixty negatives per customer, and dropping
+customers with no positive at all, cuts the training rows by roughly twenty-five times and
+scores better. The ratio was re-tuned on the validation week after the pool doubled in
+size, and anything from ten to three hundred lands within 1.5% of the same score, which
+in hindsight was the first sign that this knob was not worth tuning at all.
+
+#### What each stage is worth
+
+The pool already arrives in an order, since every candidate carries the best position any
+retriever gave it. Reading the pool out in that order scores the retrieval stage on its
+own, before the ranker has said anything, so the gap between the two rows is what stage
+two is actually buying.
+
+<!-- generated:stages -->
+| stage | MAP@12 | R@12 | NDCG@12 | Hit@12 | R@100 |
+|---|---|---|---|---|---|
+| 1. retrieval, pool order | 0.01611 | 0.04415 | 0.02696 | 0.09025 | 0.15461 |
+| 2. reranked, final | 0.02925 | 0.06778 | 0.04478 | 0.12924 | 0.17380 |
+
+The pool puts 1,055 candidates per customer in front of the ranker and makes 47.5% of what they actually bought reachable. Reordering those candidates is worth 82% on MAP@12 over the order they arrived in, and the ranker converts 37% of the reachable purchases into recall@100.
+<!-- /generated -->
+
+#### Who the model actually helps
+
+An average over every customer hides which job the model is doing. Recommending to
+somebody with forty purchases behind them is a different problem from recommending to
+somebody the pipeline has never seen buy anything, and for that second group only the
+bestseller retriever can reach them at all.
+
+<!-- generated:segments -->
+| customers | n | MAP@12 | R@100 |
+|---|---|---|---|
+| cold (no history) | 848 | 0.01171 | 0.10472 |
+| light (1-4) | 725 | 0.03658 | 0.18010 |
+| heavy (5+) | 2,582 | 0.03295 | 0.19472 |
+<!-- /generated -->
+
+Cold customers score about a third of what the other two groups do, and that gap is the
+honest headline: most of the score comes from people the model already had a history for,
+which is the group that needs a recommender least. For them only the bestseller retriever
+can reach anything at all, so they get the same non-personalised list as everybody else.
+
+The ordering of the other two is worth noticing. Light buyers score slightly *above* heavy
+ones on MAP@12 while scoring below them on recall@100. Somebody who bought forty things
+is not easier to predict than somebody who bought three, because MAP divides by how much
+they bought: a heavy buyer has more purchases to find and twelve slots to find them in.
+
+#### What the recommendations look like
+
+Accuracy would not notice a model that had quietly learned to show everybody the same few
+hundred bestsellers, because on a catalog this skewed that strategy scores respectably.
+
+<!-- generated:catalog -->
+| measure | value |
+|---|---|
+| catalog coverage @12 | 0.0404 |
+| novelty @12 (bits) | 12.88 |
+| intra-list diversity @12 | 0.4001 |
+<!-- /generated -->
+
+Coverage is the share of the 28,086 articles that appear in anybody's top twelve, novelty
+is how un-obvious those articles are in bits, and diversity is how many distinct product
+types sit inside one list of twelve.
 
 ![Two-stage recommendations](docs/images/demo_two_stage.png)
+
+![Two-stage recommendations, second customer](docs/images/demo_two_stage_2.png)
+
+![Two-stage recommendations, third customer](docs/images/demo_two_stage_3.png)
 
 Two results from this are more interesting than the score.
 
@@ -340,7 +410,7 @@ Two results from this are more interesting than the score.
 reached a ceiling of 0.085, and the ranker extracted 97% of it: ranking was saturated and
 recall was the only lever worth pulling. Adding cheap heuristic retrievers lifted the
 ceiling to 0.32. Improving the two-tower and pooling it with recent bestsellers at a
-thousand candidates lifted it again to about 0.48.
+thousand candidates lifted it again to about 0.47.
 
 The ranker now converts roughly a third of that into recall@100. The last step makes the
 point plainly: the ceiling rose by half and MAP@12 moved about two percent. The right
@@ -357,20 +427,21 @@ individual orderings.
 All five models, same test week, same metrics module, 4,155 customers who bought
 something during that week.
 
+<!-- generated:results -->
 | model | P@12 | R@12 | Hit@12 | NDCG@12 | MAP@12 | P@50 | R@50 | Hit@50 | NDCG@50 | MAP@50 | P@100 | R@100 | Hit@100 | NDCG@100 | MAP@100 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 01 popularity | 0.00283 | 0.01146 | 0.03201 | 0.00715 | 0.00350 | 0.00142 | 0.02345 | 0.06426 | 0.01045 | 0.00396 | 0.00126 | 0.04052 | 0.10686 | 0.01427 | 0.00424 |
-| 02 collaborative ALS | 0.00959 | 0.05196 | 0.09338 | 0.03547 | 0.02434 | 0.00375 | 0.07603 | 0.14320 | 0.04222 | 0.02555 | 0.00238 | 0.09462 | 0.17786 | 0.04611 | 0.02587 |
-| 03 content-based | 0.00590 | 0.03319 | 0.06065 | 0.02492 | 0.01833 | 0.00256 | 0.05383 | 0.10181 | 0.03053 | 0.01934 | 0.00185 | 0.07272 | 0.14176 | 0.03465 | 0.01967 |
-| 04 two-tower | 0.00850 | 0.04270 | 0.08568 | 0.02910 | 0.01888 | 0.00494 | 0.09401 | 0.18267 | 0.04317 | 0.02144 | 0.00370 | 0.13608 | 0.25704 | 0.05217 | 0.02223 |
-| **05 two-stage ranker** | **0.01332** | **0.06767** | **0.13020** | **0.04542** | **0.02978** | **0.00663** | **0.12501** | **0.24741** | **0.06142** | **0.03259** | **0.00483** | **0.17448** | **0.33333** | **0.07222** | **0.03354** |
+| 02 collaborative als | 0.00959 | 0.05196 | 0.09338 | 0.03547 | 0.02434 | 0.00375 | 0.07603 | 0.14320 | 0.04222 | 0.02555 | 0.00238 | 0.09462 | 0.17786 | 0.04611 | 0.02587 |
+| 03 content based | 0.00590 | 0.03319 | 0.06065 | 0.02492 | 0.01833 | 0.00256 | 0.05383 | 0.10181 | 0.03053 | 0.01934 | 0.00185 | 0.07272 | 0.14176 | 0.03465 | 0.01967 |
+| 04 two tower | 0.00870 | 0.04367 | 0.08809 | 0.02879 | 0.01809 | 0.00496 | 0.09349 | 0.18291 | 0.04252 | 0.02060 | 0.00369 | 0.13526 | 0.25752 | 0.05147 | 0.02137 |
+| **05 two stage ranker** | **0.01316** | **0.06778** | **0.12924** | **0.04478** | **0.02925** | **0.00675** | **0.12791** | **0.24789** | **0.06162** | **0.03227** | **0.00477** | **0.17380** | **0.32948** | **0.07165** | **0.03315** |
+<!-- /generated -->
 
 ![Final comparison](docs/images/comparison_chart.png)
 
-The two-stage system ends up at about 9 times the popularity floor on MAP@12 and
-nearly four times its hit rate, and it wins on every single column. It also beats its own
-best retriever, ALS, by 22% — which is the thing a two-stage system has to do to justify
-existing.
+<!-- generated:headline -->
+The two-stage system ends up at about 8.4 times the popularity floor on MAP@12 and 4.0 times its hit rate, and it wins on every single column. It also beats its own best retriever, ALS, by 20% — which is the thing a two-stage system has to do to justify existing.
+<!-- /generated -->
 
 ## What these numbers actually mean
 
@@ -379,27 +450,121 @@ They are small, and they are supposed to be. The team that won this competition 
 multi-strategy recall ensemble. Anyone quoting a much higher number on this task is
 usually measuring something easier.
 
-It helps to think about what MAP@12 of 0.030 represents. A typical customer bought two
+It helps to think about what MAP@12 of 0.029 represents. A typical customer bought two
 or three things during the test week, out of a catalog of 28,000 articles, and about a
 fifth of what they bought had never been sold before. Getting one of those twelve slots
 right about 13% of the time is not a broken model — it is a genuinely hard prediction.
 
 One caveat on reproducibility. The sampling, ALS and content-based stages are fully
-deterministic and give identical numbers every run. Two-tower training is not, because
-of GPU non-determinism, and it moves MAP@12 by roughly ±0.001 between runs, which
-carries into the two-stage model through the candidate pool.
+deterministic and give identical numbers every run. Two-tower training is not, because of
+GPU non-determinism, and since the two-stage model retrains a two-tower for every label
+week, that carries into its score through the candidate pool. This is measured rather
+than guessed at:
+
+<!-- generated:noise -->
+Re-running the identical configuration on the same test week gives MAP@12 of 0.02925, 0.02944, 0.02969, 0.02986 — a range of 0.00061 across 4 runs. The standard deviation across seeds is 0.00036, so anything below roughly 0.0007 is noise rather than a result, and the ranker tuning described above sat well inside that.
+<!-- /generated -->
+
+## How solid are these numbers
+
+The table above is one held-out week scored once. That is enough to separate five models
+that differ by large margins, and not enough to trust a small difference. I learned that
+the hard way on this project: two rounds of tuning produced changes that looked clearly
+good on the validation week and turned out to be worth nothing on the test week.
+
+So `src/validation.py` re-runs the whole two-stage pipeline over four held-out weeks and
+three seeds. Nothing is shared between runs. Each fold refits the retrievers, rebuilds its
+label weeks and retrains the ranker using only data from before its own evaluation week,
+because reusing any fitted object across folds would leak the week being scored.
+
+Each fold moves both windows together, because they cannot be moved independently. If the
+model trained through mid-September and were then scored on a week in early September, it
+would have seen those purchases during training and the score would be meaningless. The
+evaluation week has to sit after everything the model learned from, so sliding it also
+slides the training cutoff.
+
+| fold | fits on | training ends | evaluates |
+|---|---|---|---|
+| 0 | 367,862 rows | 2020-09-15 | 09-16 to 09-22 |
+| 1 | 352,678 rows | 2020-09-08 | 09-09 to 09-15 |
+| 2 | 336,710 rows | 2020-09-01 | 09-02 to 09-08 |
+| 3 | 319,159 rows | 2020-08-25 | 08-26 to 09-01 |
+
+One thing that is controlled: the gap between training and evaluation is exactly zero in
+every fold, since the fitting data always ends the day before the evaluation week begins.
+No fold is working from staler data than another, so the variation below is not a recency
+artefact.
+
+<!-- generated:cv -->
+| fold | customers | seed 7 | seed 13 | seed 42 | mean |
+|---|---|---|---|---|---|
+| 0 | 4,155 | 0.02944 | 0.02986 | 0.02969 | 0.02966 |
+| 1 | 4,383 | 0.02805 | 0.02905 | 0.02886 | 0.02866 |
+| 2 | 4,602 | 0.02297 | 0.02344 | 0.02288 | 0.02309 |
+| 3 | 4,936 | 0.02384 | 0.02311 | 0.02315 | 0.02337 |
+
+| metric | mean | std across folds | std across seeds | min | max |
+|---|---|---|---|---|---|
+| map@12 | 0.026195 | 0.00345 | 0.000363 | 0.022876 | 0.029856 |
+| ndcg@12 | 0.040544 | 0.004446 | 0.000562 | 0.036226 | 0.045512 |
+| recall@100 | 0.168137 | 0.005597 | 0.001691 | 0.160931 | 0.175574 |
+<!-- /generated -->
+
+![Cross-validation across four weeks and three seeds](docs/images/cross_validation.png)
+
+Two spreads are reported because they mean different things. The spread **across seeds**
+is the same week re-run with a different random draw, so it is this pipeline's own noise
+floor. The spread **across folds** is how much the score depends on which week you happened
+to test on. The second is about ten times the first, and that is the main thing this
+exercise found.
+
+It is worth being blunt about what that implies. Every hyperparameter change I made in
+this project moved the score by less than the fold spread, and most by less than the seed
+spread. The gains that survived came from giving a model information it did not have
+before, never from tuning what it already had.
+
+The weeks themselves differ more than I expected. The two most recent weeks both score
+near 0.029 and the two before them near 0.023, and I could not pin that down to one cause.
+The share of evaluated customers with no purchase history moves only from 20.4% to 22.8%
+across the folds, which is far too small to account for it. The rate at which customers
+re-buy something they already own does drop in the weaker weeks, from about 2.96% to
+2.45%, and that is the single highest-precision signal the ranker has, but it moves in the
+right direction without being large enough to carry the whole gap. The pool's own ceiling
+also falls in the two weaker folds, so some of it is retrieval rather than ranking.
+
+There is a confound in this design that I want to state rather than gloss over. The folds
+differ in two ways at once: which week they predict, and how much history they fit on,
+which falls from 367,862 rows to 319,159 across the four. So "that week was harder" and
+"that fold had 13% less data to learn from" cannot currently be told apart. The step shape
+of the results argues against data volume being the whole story, since a shrinking training
+set should produce a smooth decline rather than two high weeks followed by two low ones,
+but ruling an explanation out is not the same as proving the alternative.
+
+The clean way to settle it is a sliding window rather than an expanding one: hold the
+number of weeks of history constant across folds so that only the evaluation week changes.
+If the spread stays near 0.0035 the weeks genuinely differ; if it collapses, the cause was
+data volume all along.
+
+The practical consequence is that the reported test week is the most favourable of the
+four, and the four-week mean of 0.0262 is a fairer estimate of what this model does on an
+arbitrary week than the 0.0298 in the table above.
+
+The headline table stays on the fixed test week rather than switching to that mean, because
+models 1 to 4 were scored on that week and re-running all of them for every fold would cost
+hours to sharpen a comparison that is already unambiguous. Since every model shares the
+week, the ranking between them is unaffected; what the cross-validation changes is how much
+precision the absolute number deserves.
 
 ## What I would do with more compute
 
 These are things I deliberately did not do, not things I ran out of time for.
 
-**Give the ranker more features.** This is now the highest-value change, and the ceiling
-measurement says so: the pool makes a recall of 0.32 reachable and the ranker gets about
-half of it, so the gain has to come from better ordering rather than more candidates.
-Thirteen features is a deliberate limit; the winning solutions used hundreds. Price
-relative to what this customer usually spends, how a product is selling week over week,
-sales channel preference, age-group affinity per article — each is small on its own and
-they add up.
+**Give the ranker more features.** Seventeen is a deliberate limit and the winning
+solutions used hundreds. Going from nine to seventeen was the last change that moved the
+score at all, so this is the direction that has actually paid here. Sales channel
+preference, age-group affinity per article, and the retrievers' raw scores rather than
+only their ranks are the obvious next ones: the ranker currently knows the two-tower put
+an article at position 47, but not whether it scored 0.81 or 0.34.
 
 **Fine-tune the image encoder instead of freezing it.** CLIP was trained on general
 internet images, not on clothing photographed flat on a grey background. Fine-tuning it
@@ -412,14 +577,11 @@ recency weight. What they bought in order carries more information than that —
 bought last week changes what makes sense this week in a way a weighted average cannot
 express. A small transformer over the purchase sequence is the standard answer.
 
-**Push the candidate pool further.** Widening recall was worth a lot once, taking the
-ceiling from 0.085 to 0.32, and there is more left: larger k per retriever, an item-item
-cosine kNN retriever, and candidates drawn from what similar customers bought.
-
-**Fine-tune the image encoder instead of freezing it.** CLIP was trained on general
-internet images, not clothing photographed flat on a grey background, and fine-tuning it
-against purchase co-occurrence would likely sharpen the item vectors that both the content
-model and the two-tower depend on.
+**Push the candidate pool further.** Widening recall was worth a lot twice, taking the
+ceiling from 0.085 to 0.32 and then to about 0.47, and it is still where the larger loss
+sits: half of what customers actually bought never reaches the ranker at all. Larger k per
+retriever, an item-item cosine kNN retriever, and candidates drawn from what similar
+customers bought are the next things to try.
 
 ## Running it
 

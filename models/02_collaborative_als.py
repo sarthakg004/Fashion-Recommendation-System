@@ -103,10 +103,11 @@ def fit(matrix):
     return model, weighted
 
 
-def recommend(model, weighted, customers, items, user_index, fallback) -> dict[str, list[int]]:
+def recommend(model, weighted, customers, items, user_index, fallback, n: int = N_RECOMMENDATIONS) -> dict[str, list[int]]:
+    """Top-n articles per customer. ``n`` is capped at the catalog size."""
     known = [c for c in customers if c in user_index]
     rows = np.array([user_index[c] for c in known])
-    ranked, _ = model.recommend(rows, weighted[rows], N=N_RECOMMENDATIONS, filter_already_liked_items=False)
+    ranked, _ = model.recommend(rows, weighted[rows], N=min(n, len(items)), filter_already_liked_items=False)
     personalised = {c: [items[j] for j in row] for c, row in zip(known, ranked)}
     return {c: personalised.get(c, fallback) for c in customers}
 

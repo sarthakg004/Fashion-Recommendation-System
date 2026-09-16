@@ -6,6 +6,7 @@ Every model script reads the same three parquet files written by
 
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import polars as pl
@@ -37,6 +38,26 @@ def load_fitting_data() -> pl.DataFrame:
     All five models use this, so the comparison stays like for like.
     """
     return load_transactions().filter(pl.col("split") != "test")
+
+
+def split_at(weeks_back: int = 0) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Fitting frame and evaluation week, counted back from the test week.
+
+    ``weeks_back=0`` reproduces the fixed split exactly: everything before the
+    test week to fit on, the test week to score against. Larger values slide
+    both windows one week earlier, which is what lets the whole pipeline be run
+    against several held-out weeks instead of trusting a single one. A metric
+    from one week carries the quirks of that week, and on a fashion catalog
+    those are real: a cold snap or a promotion moves the bestseller list enough
+    to move the score.
+    """
+    transactions = load_transactions()
+    end = transactions["t_dat"].max() - dt.timedelta(days=7 * weeks_back)
+    start = end - dt.timedelta(days=6)
+    return (
+        transactions.filter(pl.col("t_dat") < start),
+        transactions.filter((pl.col("t_dat") >= start) & (pl.col("t_dat") <= end)),
+    )
 
 
 def load_articles() -> pl.DataFrame:

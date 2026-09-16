@@ -7,15 +7,18 @@ The winning Kaggle solutions did not pick one - they pooled candidates from many
 cheap retrievers and trained a ranker to sort the pool. This is that idea at a
 readable scale.
 
-Stage one, recall: every retriever in ``src/retrievers.py`` nominates its top
-candidates and the union becomes the candidate set. Three of the six are simple
-heuristics rather than models - what sold last week, what this customer already
-bought, and other colourways of it - and they matter more than the trained models
-do. A pool of the four models alone reached a recall ceiling of 0.085, and the ranker
-extracted 97% of it - ranking was saturated and recall was the binding constraint.
-Adding the three heuristics lifts the ceiling to about 0.32, of which the ranker
-now reaches roughly half. The constraint has moved from recall to ordering, which
-is why the next gain should come from richer features rather than more candidates.
+Stage one, recall: two retrievers nominate 700 candidates each and the union
+becomes the candidate set - what sold in the last seven days, which nothing here
+beats on a catalog that turns over weekly, and the two-tower, the strongest
+learned retriever of the five. Earlier versions pooled all six classes in
+``src/retrievers.py`` at 500 candidates each and reached a recall ceiling of 0.32;
+these two at 700 reach about 0.47 on a third of the code, because the other four
+were mostly nominating articles these two already had. The rest are kept because
+they stay cheap to pool back in, not because the default needs them.
+
+The ceiling is what the pool makes reachable, and roughly half of test purchases
+are not in it at any size tried. Retrieval, not ranking, is still the larger loss
+in this system.
 
 Stage two, ranking: describe every (customer, candidate) pair with seventeen
 features and train LightGBM's lambdarank objective on them. Each tree corrects
@@ -73,6 +76,25 @@ each with its own buffers is what makes a pool this size run out of room. Peak
 usage is a little over 2.5 GB regardless of how many candidates each retriever
 nominates.
 
+Both stages are scored, not just the final one. Reading the pool out in its own
+arrival order - by ``best_rank``, before the ranker has said anything - gives the
+score the retrieval stage reaches alone, and the difference between that and the
+reranked score is what stage two is actually worth. Customers are also scored in
+three groups by how much history the model had on them, because an average over
+everyone hides that this is a much easier job for someone with forty purchases
+behind them than for someone with none.
+
+Accuracy alone would not notice a recommender that has learned to show everybody
+the same few hundred bestsellers, so ``beyond_accuracy`` reports what share of
+the catalog the top-12 lists touch, how obvious the articles in them are, and how
+many distinct product types a single list contains.
+
+One week scored once is a single draw. ``src/validation.py`` re-runs this whole
+file over several held-out weeks and several seeds, which is what separates a
+real gain from the pipeline's own noise - and that noise is not negligible, since
+the two-tower is retrained per fold on a GPU and two identical runs land about
+0.0005 MAP@12 apart.
+
 Run it directly to build, train, score and append the row to
 results/metrics_comparison.csv.
 """
@@ -85,6 +107,7 @@ os.environ.setdefault("POLARS_MAX_THREADS", "4")
 
 import datetime as dt
 import gc
+import json
 import sys
 from pathlib import Path
 
@@ -95,11 +118,12 @@ from lightgbm import LGBMRanker
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.data_utils import load_articles, load_fitting_data, load_transactions, purchases_by_customer
-from src.metrics import KS, evaluate, save_result
+from src.data_utils import load_articles, load_fitting_data, purchases_by_customer, split_at
+from src.metrics import KS, beyond_accuracy, evaluate, evaluate_segments, save_result
 from src.retrievers import Retriever, default_retrievers
 
 MODEL_NAME = "05_two_stage_ranker"
+REPORT_PATH = Path(__file__).resolve().parents[1] / "results" / "two_stage_report.json"
 N_RECOMMENDATIONS = max(KS)
 MISSING_RANK = 9999
 LABEL_WEEKS = 4
@@ -296,10 +320,15 @@ def oracle_recall(pool: pl.DataFrame, truth: dict[str, list[int]]) -> float:
     )
 
 
-def rank_pool(model: LGBMRanker, pool: pl.DataFrame, customers, features: list[str], fallback: list[int]) -> dict[str, list[int]]:
-    scored = pool.with_columns(pl.Series("score", model.predict(pool.select(features).to_numpy())))
+def take_top(pool: pl.DataFrame, column: str, customers, fallback: list[int], descending: bool) -> dict[str, list[int]]:
+    """Best N_RECOMMENDATIONS per customer by one column, padded with the fallback.
+
+    Both stages are read out through this: the ranker sorts on its own score,
+    and the retrieval stage on ``best_rank``, which is the order the pool
+    arrived in before anything was learned about it.
+    """
     ordered = (
-        scored.sort(["customer_id", "score"], descending=[False, True])
+        pool.sort(["customer_id", column], descending=[False, descending])
         .group_by("customer_id", maintain_order=True)
         .agg(pl.col("article_id").head(N_RECOMMENDATIONS))
     )
@@ -314,7 +343,29 @@ def rank_pool(model: LGBMRanker, pool: pl.DataFrame, customers, features: list[s
     return complete
 
 
-def downsample(pool: pl.DataFrame, negatives_per_customer: int = NEGATIVES_PER_CUSTOMER) -> pl.DataFrame:
+def rank_pool(model: LGBMRanker, pool: pl.DataFrame, customers, features: list[str], fallback: list[int]) -> dict[str, list[int]]:
+    scored = pool.with_columns(pl.Series("score", model.predict(pool.select(features).to_numpy())))
+    return take_top(scored, "score", customers, fallback, descending=True)
+
+
+def customer_segments(fitting: pl.DataFrame, truth: dict[str, list[int]]) -> dict[str, set[str]]:
+    """Group the evaluated customers by how much history the model had on them.
+
+    Recommending to someone with forty purchases behind them is a different job
+    from recommending to someone with none, and a single average silently mixes
+    the two. Cold customers here are the ones the pipeline has never seen buy
+    anything, so only the bestseller retriever can reach them at all.
+    """
+    counted = fitting.group_by("customer_id").agg(pl.len().alias("n"))
+    counts = dict(zip(counted["customer_id"].to_list(), counted["n"].to_list()))
+    groups: dict[str, set[str]] = {"cold (no history)": set(), "light (1-4)": set(), "heavy (5+)": set()}
+    for customer in truth:
+        n = counts.get(customer, 0)
+        groups["cold (no history)" if n == 0 else "light (1-4)" if n < 5 else "heavy (5+)"].add(customer)
+    return {name: members for name, members in groups.items() if members}
+
+
+def downsample(pool: pl.DataFrame, negatives_per_customer: int = NEGATIVES_PER_CUSTOMER, seed: int = SEED) -> pl.DataFrame:
     """Keep every positive and a few negatives per customer.
 
     A full pool is a fraction of a percent positives, which is what the ranker
@@ -326,7 +377,7 @@ def downsample(pool: pl.DataFrame, negatives_per_customer: int = NEGATIVES_PER_C
     positives = pool.filter(pl.col("bought") == 1)
     negatives = (
         pool.filter((pl.col("bought") == 0) & pl.col("customer_id").is_in(positives["customer_id"].unique()))
-        .sample(fraction=1.0, shuffle=True, seed=SEED)
+        .sample(fraction=1.0, shuffle=True, seed=seed)
         .with_columns(pl.int_range(pl.len()).over("customer_id").alias("draw"))
         .filter(pl.col("draw") < negatives_per_customer)
         .drop("draw")
@@ -334,10 +385,14 @@ def downsample(pool: pl.DataFrame, negatives_per_customer: int = NEGATIVES_PER_C
     return pl.concat([positives, negatives])
 
 
-def label_weeks(n_weeks: int = LABEL_WEEKS):
-    """Rolling origin: each week paired with the history available before it."""
-    transactions = load_transactions()
-    labelled = transactions.filter(pl.col("split") != "test")
+def label_weeks(n_weeks: int = LABEL_WEEKS, fitting: pl.DataFrame | None = None):
+    """Rolling origin: each week paired with the history available before it.
+
+    ``fitting`` is everything the model may learn from, so its final week is the
+    most recent week that can be labelled. Defaults to the fixed train-plus-val
+    frame; cross-validation passes an earlier one.
+    """
+    labelled = load_fitting_data() if fitting is None else fitting
     last_day = labelled["t_dat"].max()
 
     for index in range(n_weeks):
@@ -348,7 +403,8 @@ def label_weeks(n_weeks: int = LABEL_WEEKS):
         yield index, history, purchases_by_customer(week)
 
 
-def build_training_pool(n_weeks: int = LABEL_WEEKS, verbose: bool = True) -> pl.DataFrame:
+def build_training_pool(n_weeks: int = LABEL_WEEKS, verbose: bool = True,
+                        fitting: pl.DataFrame | None = None, seed: int = SEED) -> pl.DataFrame:
     """Stack several labelled weeks, each built from its own history.
 
     Two things keep this inside memory. Negatives are dropped before the feature
@@ -358,7 +414,7 @@ def build_training_pool(n_weeks: int = LABEL_WEEKS, verbose: bool = True) -> pl.
     than on how many candidates each retriever nominates.
     """
     weeks = []
-    for index, history, truth in label_weeks(n_weeks):
+    for index, history, truth in label_weeks(n_weeks, fitting):
         retrievers = [r.fit(history) for r in default_retrievers()]
         rank_columns = [f"rank_{r.name}" for r in retrievers]
         bestsellers = retrievers[0].recommend(["_"])["_"][:N_RECOMMENDATIONS]
@@ -369,7 +425,7 @@ def build_training_pool(n_weeks: int = LABEL_WEEKS, verbose: bool = True) -> pl.
             candidates = label(build_pool(retrievers, batch), truth)
             raw_pairs += candidates.height
             positives += int(candidates["bought"].sum())
-            batches.append(add_features(downsample(candidates), history, articles, customers, rank_columns))
+            batches.append(add_features(downsample(candidates, seed=seed), history, articles, customers, rank_columns))
             del candidates
             gc.collect()
 
@@ -388,14 +444,45 @@ def batched(items: list, size: int):
         yield items[start : start + size]
 
 
-def run(retrievers: list[Retriever] | None = None, n_weeks: int = LABEL_WEEKS, verbose: bool = True,
-        save: bool = True) -> dict:
-    """Fit both stages and return everything the notebook wants to look at."""
-    retrievers = retrievers or default_retrievers()
-    fitting = load_fitting_data()
-    test_truth = purchases_by_customer(load_transactions("test"))
+def write_report(scores, retrieval_scores, segments, catalog_shape, ceiling, pool_rows,
+                 path: Path = REPORT_PATH) -> Path:
+    """Everything about the final model that the README quotes, as one file.
 
-    train_pool = build_training_pool(n_weeks, verbose)
+    The README used to be written by hand from whatever run happened to be on
+    screen, which is how it twice ended up disagreeing with the results file.
+    Anything the README states about this model is regenerated from here.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(
+        {
+            "ceiling": round(ceiling, 5),
+            "pool_rows": pool_rows,
+            "candidates_per_customer": round(pool_rows / scores["n_customers"]),
+            "final": {k: round(v, 6) if isinstance(v, float) else v for k, v in scores.items()},
+            "retrieval": {k: round(v, 6) if isinstance(v, float) else v for k, v in retrieval_scores.items()},
+            "segments": {name: {k: round(v, 6) if isinstance(v, float) else v for k, v in part.items()}
+                         for name, part in segments.items()},
+            "catalog_shape": {k: round(v, 5) for k, v in catalog_shape.items()},
+        },
+        indent=2,
+    ))
+    return path
+
+
+def run(retrievers: list[Retriever] | None = None, n_weeks: int = LABEL_WEEKS, verbose: bool = True,
+        save: bool = True, weeks_back: int = 0, seed: int = SEED) -> dict:
+    """Fit both stages and return everything the notebook wants to look at.
+
+    ``weeks_back`` chooses which week to hold out, counting back from the test
+    week, and ``seed`` drives both the negative sample and the ranker. Varying
+    them is how the cross-validation in ``src/validation.py`` separates a real
+    difference from the noise of one week and one random draw.
+    """
+    retrievers = retrievers or default_retrievers()
+    fitting, evaluation = split_at(weeks_back)
+    test_truth = purchases_by_customer(evaluation)
+
+    train_pool = build_training_pool(n_weeks, verbose, fitting=fitting, seed=seed)
 
     for retriever in retrievers:
         retriever.fit(fitting)
@@ -407,27 +494,42 @@ def run(retrievers: list[Retriever] | None = None, n_weeks: int = LABEL_WEEKS, v
     pool_rows = 0
 
     groups = train_pool.group_by("week", "customer_id", maintain_order=True).len()["len"].to_numpy()
-    model = LGBMRanker(**LGBM_PARAMS)
+    model = LGBMRanker(**{**LGBM_PARAMS, "random_state": seed})
     model.fit(train_pool.select(features).to_numpy(), train_pool["bought"].to_numpy(), group=groups)
 
-    predictions, reachable = {}, []
+    predictions, retrieved, reachable = {}, {}, []
     for batch in batched(list(test_truth), CUSTOMER_BATCH):
         pool = build_pool(retrievers, batch)
         reachable.append(oracle_recall(pool, {c: test_truth[c] for c in batch}))
         featured = add_features(pool, fitting, articles, customers, rank_columns)
         predictions.update(rank_pool(model, featured, batch, features, bestsellers))
+        retrieved.update(take_top(featured, "best_rank", batch, bestsellers, descending=False))
         pool_rows += featured.height
         del pool, featured
         gc.collect()
 
     ceiling = float(np.mean(reachable))
     scores = evaluate(predictions, test_truth)
+
+    counts = fitting.group_by("article_id").agg(pl.len().alias("n"))
+    catalog = load_articles().select("article_id", "product_type_no")
+    retrieval_scores = evaluate(retrieved, test_truth)
+    segments = evaluate_segments(predictions, test_truth, customer_segments(fitting, test_truth))
+    catalog_shape = beyond_accuracy(
+        predictions,
+        dict(zip(counts["article_id"].to_list(), counts["n"].to_list())),
+        dict(zip(catalog["article_id"].to_list(), catalog["product_type_no"].to_list())),
+        catalog.height,
+    )
+
     if save:
         save_result(MODEL_NAME, scores)
+        write_report(scores, retrieval_scores, segments, catalog_shape, ceiling, pool_rows)
 
     return dict(
         scores=scores, predictions=predictions, model=model, train_pool=train_pool, pool_rows=pool_rows,
-        ceiling=ceiling, bestsellers=bestsellers, retrievers=retrievers,
+        ceiling=ceiling, bestsellers=bestsellers, retrievers=retrievers, weeks_back=weeks_back, seed=seed,
+        retrieval_scores=retrieval_scores, segments=segments, catalog_shape=catalog_shape,
         recall_by_retriever=pl.DataFrame(
             [
                 {"retriever": r.name, "k": r.k,
@@ -449,6 +551,13 @@ def main() -> dict:
     print("  top features: " + ", ".join(f"{row[0]}={int(row[1])}" for row in result["importance"].head(5).iter_rows()))
     for k in KS:
         print(f"  @{k:<4} " + "  ".join(f"{m}={scores[f'{m}@{k}']:.5f}" for m in ("precision", "recall", "hitrate", "ndcg", "map")))
+
+    retrieval = result["retrieval_scores"]
+    print(f"  stage 1 (pool order):  map@12={retrieval['map@12']:.5f}  recall@12={retrieval['recall@12']:.5f}")
+    print(f"  stage 2 (reranked):    map@12={scores['map@12']:.5f}  recall@12={scores['recall@12']:.5f}")
+    for name, part in result["segments"].items():
+        print(f"  {name:<18} n={part['n_customers']:>5,}  map@12={part['map@12']:.5f}  recall@100={part['recall@100']:.5f}")
+    print("  catalog shape: " + "  ".join(f"{k}={v:.4f}" for k, v in result["catalog_shape"].items()))
     return scores
 
 

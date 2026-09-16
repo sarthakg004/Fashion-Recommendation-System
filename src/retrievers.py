@@ -175,8 +175,7 @@ class AlsRetriever(Retriever):
         return self
 
     def recommend(self, customers: list[str]) -> dict[str, list[int]]:
-        ranked = self._als.recommend(self.model, self.weighted, customers, self.items, self.index, [])
-        return {customer: items[: self.k] for customer, items in ranked.items()}
+        return self._als.recommend(self.model, self.weighted, customers, self.items, self.index, [], n=self.k)
 
 
 class ContentRetriever(Retriever):
@@ -199,10 +198,9 @@ class ContentRetriever(Retriever):
         return self
 
     def recommend(self, customers: list[str]) -> dict[str, list[int]]:
-        ranked = self._content.recommend(
-            self.profiles, self.blocks, self.weights, customers, self.index, self.articles, []
+        return self._content.recommend(
+            self.profiles, self.blocks, self.weights, customers, self.index, self.articles, [], n=self.k
         )
-        return {customer: items[: self.k] for customer, items in ranked.items()}
 
 
 class TwoTowerRetriever(Retriever):

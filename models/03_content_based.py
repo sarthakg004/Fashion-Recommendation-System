@@ -128,7 +128,9 @@ def customer_profiles(train: pl.DataFrame, article_ids: list[int], blocks: list[
     return [normalize(weights @ block).astype(np.float32) for block in blocks], customer_index
 
 
-def recommend(profiles, item_blocks, weights, customers, customer_index, article_ids, fallback) -> dict[str, list[int]]:
+def recommend(profiles, item_blocks, weights, customers, customer_index, article_ids, fallback,
+              n: int = N_RECOMMENDATIONS) -> dict[str, list[int]]:
+    """Top-n articles per customer. ``n`` is capped at the catalog size."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     items = [torch.from_numpy(block).to(device) for block in item_blocks]
     known = [c for c in customers if c in customer_index]
@@ -141,7 +143,7 @@ def recommend(profiles, item_blocks, weights, customers, customer_index, article
             weight * (torch.from_numpy(profile[batch]).to(device) @ item.T)
             for weight, profile, item in zip(weights, profiles, items)
         )
-        top = scores.topk(N_RECOMMENDATIONS, dim=1).indices.cpu().numpy()
+        top = scores.topk(min(n, len(article_ids)), dim=1).indices.cpu().numpy()
         for customer, row in zip(known[start : start + CHUNK], top):
             predictions[customer] = [article_ids[j] for j in row]
 
