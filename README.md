@@ -293,11 +293,26 @@ purchases to re-offer, and about fifty colour variants of what they bought, so t
 contributing once the pool grows. Bestsellers and the two-tower keep paying as k rises. All
 six classes stay in the file because they are cheap to pool back in.
 
-**Stage two** describes every (customer, candidate) pair with nine features and
-trains LightGBM's `lambdarank` on them: each retriever's rank for that pair, how many of
-the six nominated it, the best rank any of them gave it, the article's purchase count,
-popularity rank and days since it last sold, how often this customer already bought it,
-and how active they are.
+**Stage two** describes every (customer, candidate) pair with seventeen features and
+trains LightGBM's `lambdarank` on them: where the candidate came from (each retriever's
+rank, how many nominated it, the best rank any gave it), how it is selling (lifetime
+purchases, last week's purchases, and last week against the week before), what it costs
+relative to what this customer usually spends, how recently and how often the customer
+buys, and three levels of affinity — this exact article, this garment in another colour,
+and this product type.
+
+Those affinity features matter more than they sound. The ranker used to see only whether
+the customer had bought that *exact* article, which is the narrowest possible match.
+Someone who bought a jumper in black is an obvious candidate for the same jumper in green,
+and that never registered before.
+
+Going from nine features to seventeen moved test MAP@12 by about 9%, and four of the five
+strongest features by gain are new ones. The ranker's own settings, by contrast, turned
+out not to matter: on the validation week 2500 trees at a low learning rate looked clearly
+best, but on the test week 600, 1200 and 2500 trees land within 0.0004 of each other,
+inside this pipeline's run-to-run variance. 600 is kept because it is the cheapest of
+three equivalent options, not because it won. Re-tuning the negative sampling ratio went
+the same way: a clear gain on validation, nothing measurable on test.
 
 Two details decide whether this works at all, and I found both the hard way.
 
@@ -347,14 +362,14 @@ something during that week.
 | 01 popularity | 0.00283 | 0.01146 | 0.03201 | 0.00715 | 0.00350 | 0.00142 | 0.02345 | 0.06426 | 0.01045 | 0.00396 | 0.00126 | 0.04052 | 0.10686 | 0.01427 | 0.00424 |
 | 02 collaborative ALS | 0.00959 | 0.05196 | 0.09338 | 0.03547 | 0.02434 | 0.00375 | 0.07603 | 0.14320 | 0.04222 | 0.02555 | 0.00238 | 0.09462 | 0.17786 | 0.04611 | 0.02587 |
 | 03 content-based | 0.00590 | 0.03319 | 0.06065 | 0.02492 | 0.01833 | 0.00256 | 0.05383 | 0.10181 | 0.03053 | 0.01934 | 0.00185 | 0.07272 | 0.14176 | 0.03465 | 0.01967 |
-| 04 two-tower | 0.00870 | 0.04385 | 0.08688 | 0.02992 | 0.01943 | 0.00493 | 0.09357 | 0.18195 | 0.04360 | 0.02191 | 0.00369 | 0.13546 | 0.25560 | 0.05262 | 0.02271 |
-| **05 two-stage ranker** | **0.01227** | **0.06380** | **0.12395** | **0.04248** | **0.02763** | **0.00631** | **0.11998** | **0.24212** | **0.05814** | **0.03029** | **0.00464** | **0.16831** | **0.32876** | **0.06869** | **0.03120** |
+| 04 two-tower | 0.00850 | 0.04270 | 0.08568 | 0.02910 | 0.01888 | 0.00494 | 0.09401 | 0.18267 | 0.04317 | 0.02144 | 0.00370 | 0.13608 | 0.25704 | 0.05217 | 0.02223 |
+| **05 two-stage ranker** | **0.01332** | **0.06767** | **0.13020** | **0.04542** | **0.02978** | **0.00663** | **0.12501** | **0.24741** | **0.06142** | **0.03259** | **0.00483** | **0.17448** | **0.33333** | **0.07222** | **0.03354** |
 
 ![Final comparison](docs/images/comparison_chart.png)
 
-The two-stage system ends up at about 8 times the popularity floor on MAP@12 and
+The two-stage system ends up at about 9 times the popularity floor on MAP@12 and
 nearly four times its hit rate, and it wins on every single column. It also beats its own
-best retriever, ALS, by 14% — which is the thing a two-stage system has to do to justify
+best retriever, ALS, by 22% — which is the thing a two-stage system has to do to justify
 existing.
 
 ## What these numbers actually mean
@@ -364,10 +379,10 @@ They are small, and they are supposed to be. The team that won this competition 
 multi-strategy recall ensemble. Anyone quoting a much higher number on this task is
 usually measuring something easier.
 
-It helps to think about what MAP@12 of 0.028 represents. A typical customer bought two
+It helps to think about what MAP@12 of 0.030 represents. A typical customer bought two
 or three things during the test week, out of a catalog of 28,000 articles, and about a
 fifth of what they bought had never been sold before. Getting one of those twelve slots
-right about 12% of the time is not a broken model — it is a genuinely hard prediction.
+right about 13% of the time is not a broken model — it is a genuinely hard prediction.
 
 One caveat on reproducibility. The sampling, ALS and content-based stages are fully
 deterministic and give identical numbers every run. Two-tower training is not, because
