@@ -335,14 +335,14 @@ something during that week.
 | 01 popularity | 0.00283 | 0.01146 | 0.03201 | 0.00715 | 0.00350 | 0.00142 | 0.02345 | 0.06426 | 0.01045 | 0.00396 | 0.00126 | 0.04052 | 0.10686 | 0.01427 | 0.00424 |
 | 02 collaborative ALS | 0.00959 | 0.05196 | 0.09338 | 0.03547 | 0.02434 | 0.00375 | 0.07603 | 0.14320 | 0.04222 | 0.02555 | 0.00238 | 0.09462 | 0.17786 | 0.04611 | 0.02587 |
 | 03 content-based | 0.00590 | 0.03319 | 0.06065 | 0.02492 | 0.01833 | 0.00256 | 0.05383 | 0.10181 | 0.03053 | 0.01934 | 0.00185 | 0.07272 | 0.14176 | 0.03465 | 0.01967 |
-| 04 two-tower | 0.00620 | 0.03306 | 0.06330 | 0.02271 | 0.01524 | 0.00288 | 0.05948 | 0.11047 | 0.02973 | 0.01648 | 0.00205 | 0.08051 | 0.14922 | 0.03424 | 0.01688 |
-| **05 two-stage ranker** | **0.01187** | **0.06099** | **0.11817** | **0.04183** | **0.02830** | **0.00577** | **0.11286** | **0.22383** | **0.05599** | **0.03075** | **0.00423** | **0.15707** | **0.30975** | **0.06556** | **0.03153** |
+| 04 two-tower | 0.00624 | 0.03374 | 0.06354 | 0.02294 | 0.01533 | 0.00286 | 0.05981 | 0.11071 | 0.02991 | 0.01658 | 0.00202 | 0.07767 | 0.14825 | 0.03392 | 0.01693 |
+| **05 two-stage ranker** | **0.01207** | **0.06192** | **0.11961** | **0.04150** | **0.02741** | **0.00587** | **0.11556** | **0.22792** | **0.05593** | **0.02985** | **0.00415** | **0.15423** | **0.30108** | **0.06442** | **0.03057** |
 
 ![Final comparison](docs/images/comparison_chart.png)
 
-The two-stage system ends up at about eight times the popularity floor on MAP@12 and
+The two-stage system ends up at about 8 times the popularity floor on MAP@12 and
 nearly four times its hit rate, and it wins on every single column. It also beats its own
-best retriever, ALS, by 16% — which is the thing a two-stage system has to do to justify
+best retriever, ALS, by 13% — which is the thing a two-stage system has to do to justify
 existing.
 
 ## What these numbers actually mean
@@ -352,7 +352,7 @@ They are small, and they are supposed to be. The team that won this competition 
 multi-strategy recall ensemble. Anyone quoting a much higher number on this task is
 usually measuring something easier.
 
-It helps to think about what MAP@12 of 0.028 represents. A typical customer bought two
+It helps to think about what MAP@12 of 0.027 represents. A typical customer bought two
 or three things during the test week, out of a catalog of 28,000 articles, and about a
 fifth of what they bought had never been sold before. Getting one of those twelve slots
 right about 12% of the time is not a broken model — it is a genuinely hard prediction.

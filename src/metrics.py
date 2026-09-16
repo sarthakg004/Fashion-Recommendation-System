@@ -88,6 +88,7 @@ def save_result(model_name: str, scores: dict, path: Path = RESULTS_PATH) -> Pat
         with path.open() as f:
             rows = [r for r in csv.DictReader(f) if r["model"] != model_name]
     rows.append(row)
+    rows.sort(key=lambda r: r["model"])
 
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(row))
