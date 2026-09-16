@@ -350,10 +350,10 @@ two is actually buying.
 <!-- generated:stages -->
 | stage | MAP@12 | R@12 | NDCG@12 | Hit@12 | R@100 |
 |---|---|---|---|---|---|
-| 1. retrieval, pool order | 0.01611 | 0.04415 | 0.02696 | 0.09025 | 0.15461 |
-| 2. reranked, final | 0.02925 | 0.06778 | 0.04478 | 0.12924 | 0.17380 |
+| 1. retrieval, pool order | 0.01616 | 0.04433 | 0.02716 | 0.09170 | 0.15234 |
+| 2. reranked, final | 0.03121 | 0.06950 | 0.04694 | 0.13141 | 0.17718 |
 
-The pool puts 1,055 candidates per customer in front of the ranker and makes 47.5% of what they actually bought reachable. Reordering those candidates is worth 82% on MAP@12 over the order they arrived in, and the ranker converts 37% of the reachable purchases into recall@100.
+The pool puts 1,055 candidates per customer in front of the ranker and makes 47.5% of what they actually bought reachable. Reordering those candidates is worth 93% on MAP@12 over the order they arrived in, and the ranker converts 37% of the reachable purchases into recall@100.
 <!-- /generated -->
 
 #### Who the model actually helps
@@ -366,9 +366,9 @@ bestseller retriever can reach them at all.
 <!-- generated:segments -->
 | customers | n | MAP@12 | R@100 |
 |---|---|---|---|
-| cold (no history) | 848 | 0.01171 | 0.10472 |
-| light (1-4) | 725 | 0.03658 | 0.18010 |
-| heavy (5+) | 2,582 | 0.03295 | 0.19472 |
+| cold (no history) | 848 | 0.00955 | 0.10617 |
+| light (1-4) | 725 | 0.03785 | 0.17805 |
+| heavy (5+) | 2,582 | 0.03646 | 0.20026 |
 <!-- /generated -->
 
 Cold customers score about a third of what the other two groups do, and that gap is the
@@ -389,9 +389,9 @@ hundred bestsellers, because on a catalog this skewed that strategy scores respe
 <!-- generated:catalog -->
 | measure | value |
 |---|---|
-| catalog coverage @12 | 0.0404 |
+| catalog coverage @12 | 0.0407 |
 | novelty @12 (bits) | 12.88 |
-| intra-list diversity @12 | 0.4001 |
+| intra-list diversity @12 | 0.4047 |
 <!-- /generated -->
 
 Coverage is the share of the 28,086 articles that appear in anybody's top twelve, novelty
@@ -433,14 +433,14 @@ something during that week.
 | 01 popularity | 0.00283 | 0.01146 | 0.03201 | 0.00715 | 0.00350 | 0.00142 | 0.02345 | 0.06426 | 0.01045 | 0.00396 | 0.00126 | 0.04052 | 0.10686 | 0.01427 | 0.00424 |
 | 02 collaborative als | 0.00959 | 0.05196 | 0.09338 | 0.03547 | 0.02434 | 0.00375 | 0.07603 | 0.14320 | 0.04222 | 0.02555 | 0.00238 | 0.09462 | 0.17786 | 0.04611 | 0.02587 |
 | 03 content based | 0.00590 | 0.03319 | 0.06065 | 0.02492 | 0.01833 | 0.00256 | 0.05383 | 0.10181 | 0.03053 | 0.01934 | 0.00185 | 0.07272 | 0.14176 | 0.03465 | 0.01967 |
-| 04 two tower | 0.00870 | 0.04367 | 0.08809 | 0.02879 | 0.01809 | 0.00496 | 0.09349 | 0.18291 | 0.04252 | 0.02060 | 0.00369 | 0.13526 | 0.25752 | 0.05147 | 0.02137 |
-| **05 two stage ranker** | **0.01316** | **0.06778** | **0.12924** | **0.04478** | **0.02925** | **0.00675** | **0.12791** | **0.24789** | **0.06162** | **0.03227** | **0.00477** | **0.17380** | **0.32948** | **0.07165** | **0.03315** |
+| 04 two tower | 0.00870 | 0.04369 | 0.08688 | 0.03013 | 0.01970 | 0.00500 | 0.09518 | 0.18484 | 0.04420 | 0.02223 | 0.00371 | 0.13525 | 0.25897 | 0.05289 | 0.02298 |
+| **05 two stage ranker** | **0.01352** | **0.06950** | **0.13141** | **0.04694** | **0.03121** | **0.00686** | **0.12993** | **0.25271** | **0.06371** | **0.03413** | **0.00488** | **0.17718** | **0.33357** | **0.07406** | **0.03504** |
 <!-- /generated -->
 
 ![Final comparison](docs/images/comparison_chart.png)
 
 <!-- generated:headline -->
-The two-stage system ends up at about 8.4 times the popularity floor on MAP@12 and 4.0 times its hit rate, and it wins on every single column. It also beats its own best retriever, ALS, by 20% — which is the thing a two-stage system has to do to justify existing.
+The two-stage system ends up at about 8.9 times the popularity floor on MAP@12 and 4.1 times its hit rate, and it wins on every single column. It also beats its own best retriever, ALS, by 28% — which is the thing a two-stage system has to do to justify existing.
 <!-- /generated -->
 
 ## What these numbers actually mean
@@ -462,7 +462,7 @@ week, that carries into its score through the candidate pool. This is measured r
 than guessed at:
 
 <!-- generated:noise -->
-Re-running the identical configuration on the same test week gives MAP@12 of 0.02925, 0.02944, 0.02969, 0.02986 — a range of 0.00061 across 4 runs. The standard deviation across seeds is 0.00036, so anything below roughly 0.0007 is noise rather than a result, and the ranker tuning described above sat well inside that.
+Re-running the identical configuration on the same test week gives MAP@12 of 0.02944, 0.02969, 0.02986, 0.03121. That is a standard deviation of 0.00079 across 4 runs, so a difference smaller than about 0.0016 is noise rather than a result. Every hyperparameter change tried in this project sat inside that, which is why the reported figure below is one draw from this range rather than a fixed property of the model.
 <!-- /generated -->
 
 ## How solid are these numbers
@@ -542,8 +542,45 @@ but ruling an explanation out is not the same as proving the alternative.
 
 The clean way to settle it is a sliding window rather than an expanding one: hold the
 number of weeks of history constant across folds so that only the evaluation week changes.
-If the spread stays near 0.0035 the weeks genuinely differ; if it collapses, the cause was
-data volume all along.
+Every fold then gets exactly 16 weeks, which is all fold 3 has, so training size varies by
+3% across folds instead of 15%.
+
+<!-- generated:window -->
+| fold | expanding history | fixed 16 weeks | change |
+|---|---|---|---|
+| 0 | 0.02966 | 0.03093 | +4.3% |
+| 1 | 0.02866 | 0.02913 | +1.7% |
+| 2 | 0.02309 | 0.02358 | +2.1% |
+| 3 | 0.02337 | 0.02338 | +0.1% |
+| **std across folds** | **0.00345** | **0.00385** |  |
+<!-- /generated -->
+
+Fold 3 is the control. It already had only 16 weeks, so it loses nothing and its two
+versions differ only by GPU non-determinism; it moves by 0.1%, which is what a correct
+implementation should look like.
+
+Two separate answers come out of this.
+
+**The fold spread is real and the weeks genuinely differ.** Equalising the training data
+did not shrink it. The standard deviation across folds went from 0.0035 to 0.0039, so the
+confound above resolves in favour of the weeks rather than the data volume, and the fair
+estimate of this model on an arbitrary week stands.
+
+**Older data is mildly harmful, which I did not expect.** The improvement tracks how much
+history was cut: three weeks removed is worth 4.3%, two weeks 1.7%, one week 2.1%, and
+zero weeks 0.1%. On a catalog that turns over weekly, May purchases describe an assortment
+that no longer exists, and the model scores better for not seeing them. For scale, 4.3% is
+half of what going from nine ranker features to seventeen was worth, and that was the
+largest deliberate improvement in this project.
+
+The second finding is actionable and the pipeline does not currently use it, since every
+model fits on the whole 140-day window. It is left as a change for its own round rather
+than folded into the measurement that found it, because the honest version of that change
+means re-running all five models and re-tuning the window length itself.
+
+One limit worth stating: a fixed window moves *which* weeks are in training as well as how
+many, so if the catalog shifts seasonally that is still in play. This is a better
+controlled experiment than the expanding one, not a perfectly controlled one.
 
 The practical consequence is that the reported test week is the most favourable of the
 four, and the four-week mean of 0.0262 is a fairer estimate of what this model does on an

@@ -40,7 +40,7 @@ def load_fitting_data() -> pl.DataFrame:
     return load_transactions().filter(pl.col("split") != "test")
 
 
-def split_at(weeks_back: int = 0) -> tuple[pl.DataFrame, pl.DataFrame]:
+def split_at(weeks_back: int = 0, window_weeks: int | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Fitting frame and evaluation week, counted back from the test week.
 
     ``weeks_back=0`` reproduces the fixed split exactly: everything before the
@@ -50,12 +50,22 @@ def split_at(weeks_back: int = 0) -> tuple[pl.DataFrame, pl.DataFrame]:
     from one week carries the quirks of that week, and on a fashion catalog
     those are real: a cold snap or a promotion moves the bestseller list enough
     to move the score.
+
+    ``window_weeks`` fixes how much history each fold gets instead of letting it
+    grow toward the present. With the default expanding window a later fold has
+    both a different evaluation week and more data to fit on, so "that week was
+    harder" cannot be told apart from "that fold had less to learn from". Holding
+    the window at a fixed number of weeks removes the second difference and
+    leaves only the week.
     """
     transactions = load_transactions()
     end = transactions["t_dat"].max() - dt.timedelta(days=7 * weeks_back)
     start = end - dt.timedelta(days=6)
+    history = pl.col("t_dat") < start
+    if window_weeks is not None:
+        history = history & (pl.col("t_dat") >= start - dt.timedelta(days=7 * window_weeks))
     return (
-        transactions.filter(pl.col("t_dat") < start),
+        transactions.filter(history),
         transactions.filter((pl.col("t_dat") >= start) & (pl.col("t_dat") <= end)),
     )
 

@@ -50,10 +50,12 @@ class RollingOriginValidator:
     object across folds would leak the week being scored.
     """
 
-    def __init__(self, folds: int = 3, seeds: tuple[int, ...] = (42,), verbose: bool = True):
+    def __init__(self, folds: int = 3, seeds: tuple[int, ...] = (42,), verbose: bool = True,
+                 window_weeks: int | None = None):
         self.folds = folds
         self.seeds = tuple(seeds)
         self.verbose = verbose
+        self.window_weeks = window_weeks
         self.runs: pl.DataFrame | None = None
 
     def run(self) -> pl.DataFrame:
@@ -63,12 +65,14 @@ class RollingOriginValidator:
 
         for fold in range(self.folds):
             for seed in self.seeds:
-                result = ranker.run(verbose=False, save=False, weeks_back=fold, seed=seed)
+                result = ranker.run(verbose=False, save=False, weeks_back=fold, seed=seed,
+                                    window_weeks=self.window_weeks)
                 scores, retrieval = result["scores"], result["retrieval_scores"]
                 rows.append(
                     {
                         "fold": fold,
                         "seed": seed,
+                        "window_weeks": self.window_weeks or 0,
                         "n_customers": scores["n_customers"],
                         "ceiling": round(result["ceiling"], 5),
                         **{metric: round(scores[metric], 6) for metric in METRICS},
@@ -110,7 +114,7 @@ class RollingOriginValidator:
             raise RuntimeError("call run() first")
         path.parent.mkdir(parents=True, exist_ok=True)
         self.runs.write_csv(path)
-        self.summary().write_csv(path.with_name("cross_validation_summary.csv"))
+        self.summary().write_csv(path.with_name(f"{path.stem}_summary.csv"))
         return path
 
 

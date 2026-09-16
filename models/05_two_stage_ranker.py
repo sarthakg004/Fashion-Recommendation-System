@@ -470,16 +470,19 @@ def write_report(scores, retrieval_scores, segments, catalog_shape, ceiling, poo
 
 
 def run(retrievers: list[Retriever] | None = None, n_weeks: int = LABEL_WEEKS, verbose: bool = True,
-        save: bool = True, weeks_back: int = 0, seed: int = SEED) -> dict:
+        save: bool = True, weeks_back: int = 0, seed: int = SEED,
+        window_weeks: int | None = None) -> dict:
     """Fit both stages and return everything the notebook wants to look at.
 
     ``weeks_back`` chooses which week to hold out, counting back from the test
     week, and ``seed`` drives both the negative sample and the ranker. Varying
     them is how the cross-validation in ``src/validation.py`` separates a real
-    difference from the noise of one week and one random draw.
+    difference from the noise of one week and one random draw. ``window_weeks``
+    caps how much history is used, which is what holds training size constant
+    while the evaluation week moves.
     """
     retrievers = retrievers or default_retrievers()
-    fitting, evaluation = split_at(weeks_back)
+    fitting, evaluation = split_at(weeks_back, window_weeks)
     test_truth = purchases_by_customer(evaluation)
 
     train_pool = build_training_pool(n_weeks, verbose, fitting=fitting, seed=seed)
