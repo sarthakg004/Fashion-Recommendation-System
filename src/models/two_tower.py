@@ -49,14 +49,14 @@ Everything below was chosen on the validation week:
                        epochs 11 and 20; the old fixed 20-epoch schedule was cutting
                        training off mid-improvement.
 
-Run it directly to train, score and append the row to results/metrics_comparison.csv.
+Run it with ``python -m src.models.two_tower`` to train, score and append the row to
+results/metrics_comparison.csv. The training history and its curve go to
+``results/two_tower/``.
 """
 
 from __future__ import annotations
 
-import importlib
-import sys
-from pathlib import Path
+from collections.abc import Iterable, Sequence
 
 import numpy as np
 import polars as pl
@@ -64,14 +64,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from src.data_utils import SAMPLE, load_fitting_data, load_transactions, purchases_by_customer
-from src.metrics import KS, evaluate, save_result
-
-content = importlib.import_module("03_content_based")
-popularity = importlib.import_module("01_popularity")
+from src.data.loading import (
+    days_before_end,
+    load_customers,
+    load_fitting_data,
+    load_transactions,
+    purchases_by_customer,
+)
+from src.evaluation.metrics import KS, evaluate
+from src.evaluation.reporting import print_scores, save_result
+from src.models import content
+from src.models.base import Recommender
+from src.models.popularity import PopularityRecommender
+from src.paths import RESULTS, ROOT
 
 MODEL_NAME = "04_two_tower"
 N_RECOMMENDATIONS = max(KS)
@@ -89,32 +94,21 @@ TEMPERATURE = 0.15
 DROPOUT = 0.1
 CHUNK = 4096
 SEED = 42
-ARTIFACTS = Path(__file__).resolve().parent / "artifacts" / "two_tower"
+ARTIFACTS = RESULTS / "two_tower"
 
 CUSTOMER_CATEGORICAL = ["club_member_status", "fashion_news_frequency"]
 
 
-_ITEM_FEATURES: tuple[list[int], np.ndarray] | None = None
-
-
 def item_feature_matrix() -> tuple[list[int], np.ndarray]:
-    """Catalog features for every article, built once per process.
-
-    These describe articles, not customers, so they are identical for every fit.
-    Rebuilding them per fit meant rerunning the metadata SVD five times in a
-    single two-stage run, which cost minutes and a couple of gigabytes.
-    """
-    global _ITEM_FEATURES
-    if _ITEM_FEATURES is None:
-        article_ids = content.catalog(load_transactions())
-        features = np.hstack(
-            [
-                (1 - content.IMAGE_WEIGHT) * content.metadata_features(article_ids),
-                content.IMAGE_WEIGHT * content.image_features(article_ids, content.IMAGE_ENCODER),
-            ]
-        ).astype(np.float32)
-        _ITEM_FEATURES = (article_ids, features)
-    return _ITEM_FEATURES
+    """Content features for every catalog article: model 3's two blocks, weighted and side by side."""
+    article_ids, metadata, image = content.catalog_features(content.IMAGE_ENCODER)
+    features = np.hstack(
+        [
+            (1 - content.IMAGE_WEIGHT) * metadata,
+            content.IMAGE_WEIGHT * image,
+        ]
+    ).astype(np.float32)
+    return article_ids, features
 
 
 class Tower(nn.Module):
@@ -151,9 +145,10 @@ class ItemTower(nn.Module):
 
 
 def customer_features(customers: list[str]) -> np.ndarray:
+    """Each customer's own attributes: standardised age, the two newsletter flags, and one-hot club and news status."""
     table = (
         pl.DataFrame({"customer_id": customers})
-        .join(pl.read_parquet(SAMPLE / "customers.parquet"), on="customer_id", how="left")
+        .join(load_customers(), on="customer_id", how="left")
         .with_columns(
             ((pl.col("age") - pl.col("age").median()) / pl.col("age").std()).fill_null(0.0).alias("age_z"),
             pl.col("FN").fill_null(0.0),
@@ -172,7 +167,7 @@ def build_training_data(train: pl.DataFrame, article_ids: list[int], item_featur
     article_index = {a: i for i, a in enumerate(article_ids)}
 
     pairs = (
-        train.with_columns(((pl.lit(train["t_dat"].max()) - pl.col("t_dat")).dt.total_days()).alias("days"))
+        train.with_columns(days_before_end(train).alias("days"))
         .with_columns((1.0 / (1.0 + pl.col("days"))).alias("weight"))
         .group_by("customer_id", "article_id")
         .agg(pl.col("weight").sum())
@@ -190,164 +185,177 @@ def build_training_data(train: pl.DataFrame, article_ids: list[int], item_featur
     return customers, customer_index, rows, cols, weights, history_sum, history_weight
 
 
-def user_inputs(history_sum, history_weight, static, rows, exclude_cols=None, exclude_weights=None, item_features=None):
+def user_inputs(history_sum, history_weight, attributes, rows, exclude_cols=None, exclude_weights=None, item_features=None):
+    """User tower input: the purchase-history average, optionally minus one article, beside the customer's attributes."""
     totals = history_sum[rows]
     denominators = history_weight[rows]
     if exclude_cols is not None:
         totals = totals - exclude_weights[:, None] * item_features[exclude_cols]
         denominators = denominators - exclude_weights
     profile = totals / np.clip(denominators, 1e-6, None)[:, None]
-    return np.hstack([profile, static[rows]]).astype(np.float32)
+    return np.hstack([profile, attributes[rows]]).astype(np.float32)
 
 
-def rank(user_tower, item_tower, item_features, customers, customer_index, article_ids, history_sum, history_weight,
-         static, fallback, device, n: int = N_RECOMMENDATIONS):
-    """Top ``n`` articles per customer.
-
-    ``n`` defaults to the largest k the metrics need, but a candidate retriever
-    asks for far more than that - the pool is judged on coverage, not on the
-    twelve it would have shown.
-    """
-    user_tower.eval()
-    item_tower.eval()
-    with torch.inference_mode():
-        item_vectors = torch.cat(
-            [
-                item_tower(
-                    torch.from_numpy(item_features[i : i + CHUNK]).to(device),
-                    torch.arange(i, min(i + CHUNK, len(item_features)), device=device),
-                )
-                for i in range(0, len(item_features), CHUNK)
-            ]
-        )
-        known = [c for c in customers if c in customer_index]
-        rows = np.array([customer_index[c] for c in known])
-
-        predictions = {}
-        for start in range(0, len(rows), CHUNK):
-            batch = rows[start : start + CHUNK]
-            features = user_inputs(history_sum, history_weight, static, batch)
-            user_vectors = user_tower(torch.from_numpy(features).to(device))
-            top = (user_vectors @ item_vectors.T).topk(min(n, len(article_ids)), dim=1).indices.cpu().numpy()
-            for customer, row in zip(known[start : start + CHUNK], top):
-                predictions[customer] = [article_ids[j] for j in row]
-
-    return {c: predictions.get(c, fallback) for c in customers}
-
-
-def train_model(verbose: bool = True, epochs: int | None = None, learning_rate: float = LEARNING_RATE,
-                temperature: float = TEMPERATURE, use_item_embedding: bool = USE_ITEM_EMBEDDING,
-                batch_size: int = BATCH_SIZE, transactions: pl.DataFrame | None = None,
-                select_best: bool = True, use_logq: bool = USE_LOGQ_CORRECTION, patience: int = PATIENCE,
-                save_artifacts: bool = False, hidden_dim: int = HIDDEN_DIM, embed_dim: int = EMBED_DIM):
-    """Train both towers.
-
-    ``transactions`` overrides the training frame, which matters when this is used
-    as a candidate retriever for an earlier week: the model must see only that
-    week's history, never the week it is nominating candidates for.
+class TwoTowerRecommender(Recommender):
+    """User and item towers trained with in-batch negatives.
 
     ``select_best`` controls how training stops. With it on, the validation week
-    scores every epoch, training stops after ``patience`` epochs without
+    scores every epoch, training stops after ``PATIENCE`` epochs without
     improvement, and the best weights are restored. With it off there is no
     honest validation week available - it lies in the future of an earlier
     origin - so training runs a fixed ``RETRIEVER_EPOCHS``, the count early
-    stopping settled on during tuning.
+    stopping settled on during tuning, unless ``epochs`` says otherwise.
+
+    Whatever frame ``fit`` is given is the only history the model sees, which
+    matters when this is used as a candidate retriever for an earlier week: it
+    must never see the week it is nominating candidates for.
     """
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    train = load_transactions("train") if transactions is None else transactions
-    article_ids, item_features = item_feature_matrix()
+    name = "tower"
 
-    customers, customer_index, rows, cols, weights, history_sum, history_weight = build_training_data(train, article_ids, item_features)
-    static = customer_features(customers)
+    def __init__(self, k: int | None = None, epochs: int | None = None, select_best: bool = False,
+                 verbose: bool = False, save_artifacts: bool = False):
+        super().__init__(k)
+        self.epochs = epochs
+        self.select_best = select_best
+        self.verbose = verbose
+        self.save_artifacts = save_artifacts
 
-    epochs = epochs if epochs is not None else (EPOCHS if select_best else RETRIEVER_EPOCHS)
+    def fit(self, train: pl.DataFrame) -> "TwoTowerRecommender":
+        torch.manual_seed(SEED)
+        np.random.seed(SEED)
+        self.device = device = "cuda" if torch.cuda.is_available() else "cpu"
+        verbose, select_best = self.verbose, self.select_best
 
-    user_tower = Tower(item_features.shape[1] + static.shape[1], hidden_dim, embed_dim).to(device)
-    item_tower = ItemTower(item_features.shape[1], len(article_ids), use_item_embedding, hidden_dim, embed_dim).to(device)
-    optimizer = torch.optim.AdamW(
-        list(user_tower.parameters()) + list(item_tower.parameters()), lr=learning_rate, weight_decay=WEIGHT_DECAY
-    )
-    schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    scaler = torch.amp.GradScaler(device, enabled=device == "cuda")
+        self.article_ids, self.item_features = article_ids, item_features = item_feature_matrix()
 
-    counts = np.bincount(cols, weights=weights, minlength=len(article_ids)).astype(np.float32)
-    log_q = torch.from_numpy(np.log(np.clip(counts / counts.sum(), 1e-9, None))).to(device)
+        customers, self.customer_index, rows, cols, weights, self.history_sum, self.history_weight = build_training_data(
+            train, article_ids, item_features
+        )
+        self.customer_attributes = customer_features(customers)
 
-    val_truth = purchases_by_customer(load_transactions("val")) if select_best else {}
-    fallback = popularity.top_articles(train)
-    best_map, best_state, waited, history = -1.0, None, 0, []
+        epochs = self.epochs if self.epochs is not None else (EPOCHS if select_best else RETRIEVER_EPOCHS)
 
-    for epoch in range(1, epochs + 1):
-        user_tower.train()
-        item_tower.train()
-        order = np.random.permutation(len(rows))
-        total_loss = 0.0
+        self.user_tower = user_tower = Tower(item_features.shape[1] + self.customer_attributes.shape[1]).to(device)
+        self.item_tower = item_tower = ItemTower(item_features.shape[1], len(article_ids)).to(device)
+        optimizer = torch.optim.AdamW(
+            list(user_tower.parameters()) + list(item_tower.parameters()), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        )
+        schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        scaler = torch.amp.GradScaler(device, enabled=device == "cuda")
 
-        for start in range(0, len(order), batch_size):
-            batch = order[start : start + batch_size]
-            if len(batch) < 2:
+        counts = np.bincount(cols, weights=weights, minlength=len(article_ids)).astype(np.float32)
+        log_q = torch.from_numpy(np.log(np.clip(counts / counts.sum(), 1e-9, None))).to(device)
+
+        val_truth = purchases_by_customer(load_transactions("val")) if select_best else {}
+        fallback = PopularityRecommender().fit(train).ranked if select_best else []
+        best_map, best_state, waited, self.history = -1.0, None, 0, []
+
+        for epoch in range(1, epochs + 1):
+            user_tower.train()
+            item_tower.train()
+            order = np.random.permutation(len(rows))
+            total_loss = 0.0
+
+            for start in range(0, len(order), BATCH_SIZE):
+                batch = order[start : start + BATCH_SIZE]
+                if len(batch) < 2:
+                    continue
+                features = user_inputs(
+                    self.history_sum, self.history_weight, self.customer_attributes, rows[batch], cols[batch], weights[batch], item_features
+                )
+                users = torch.from_numpy(features).to(device)
+                items = torch.from_numpy(item_features[cols[batch]]).to(device)
+                item_ids = torch.from_numpy(cols[batch]).to(device)
+
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device, dtype=torch.float16, enabled=device == "cuda"):
+                    logits = (user_tower(users) @ item_tower(items, item_ids).T) / TEMPERATURE
+                    if USE_LOGQ_CORRECTION:
+                        logits = logits - log_q[item_ids].unsqueeze(0)
+                    loss = F.cross_entropy(logits, torch.arange(len(batch), device=device))
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                total_loss += loss.item() * len(batch)
+
+            schedule.step()
+            epoch_loss = total_loss / len(order)
+
+            if not select_best:
+                self.history.append({"epoch": epoch, "loss": epoch_loss, "val_map@12": None})
+                if verbose:
+                    print(f"  epoch {epoch:>2}  loss={epoch_loss:.4f}")
                 continue
-            features = user_inputs(history_sum, history_weight, static, rows[batch], cols[batch], weights[batch], item_features)
-            users = torch.from_numpy(features).to(device)
-            items = torch.from_numpy(item_features[cols[batch]]).to(device)
-            item_ids = torch.from_numpy(cols[batch]).to(device)
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device, dtype=torch.float16, enabled=device == "cuda"):
-                logits = (user_tower(users) @ item_tower(items, item_ids).T) / temperature
-                if use_logq:
-                    logits = logits - log_q[item_ids].unsqueeze(0)
-                loss = F.cross_entropy(logits, torch.arange(len(batch), device=device))
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            total_loss += loss.item() * len(batch)
+            val_map = evaluate(self._rank(val_truth, fallback, N_RECOMMENDATIONS), val_truth)["map@12"]
+            self.history.append({"epoch": epoch, "loss": epoch_loss, "val_map@12": val_map})
 
-        schedule.step()
-        epoch_loss = total_loss / len(order)
-
-        if not select_best:
-            history.append({"epoch": epoch, "loss": epoch_loss, "val_map@12": None})
+            improved = val_map > best_map
+            if improved:
+                best_map, waited = val_map, 0
+                best_state = ({k: v.clone() for k, v in user_tower.state_dict().items()}, {k: v.clone() for k, v in item_tower.state_dict().items()})
+            else:
+                waited += 1
             if verbose:
-                print(f"  epoch {epoch:>2}  loss={epoch_loss:.4f}")
-            continue
+                print(f"  epoch {epoch:>2}  loss={epoch_loss:.4f}  val_map@12={val_map:.5f}{'  *' if improved else ''}")
+            if waited >= PATIENCE:
+                if verbose:
+                    print(f"  early stop: no gain for {PATIENCE} epochs, best was epoch {self.best_epoch()}")
+                break
 
-        predictions = rank(user_tower, item_tower, item_features, val_truth, customer_index, article_ids, history_sum, history_weight, static, fallback, device)
-        val_map = evaluate(predictions, val_truth)["map@12"]
-        history.append({"epoch": epoch, "loss": epoch_loss, "val_map@12": val_map})
+        if best_state is not None:
+            user_tower.load_state_dict(best_state[0])
+            item_tower.load_state_dict(best_state[1])
+        self.best_val_map = best_map if select_best else None
+        if self.save_artifacts:
+            write_artifacts(self.history)
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        return self
 
-        improved = val_map > best_map
-        if improved:
-            best_map, waited = val_map, 0
-            best_state = ({k: v.clone() for k, v in user_tower.state_dict().items()}, {k: v.clone() for k, v in item_tower.state_dict().items()})
-        else:
-            waited += 1
-        if verbose:
-            print(f"  epoch {epoch:>2}  loss={epoch_loss:.4f}  val_map@12={val_map:.5f}{'  *' if improved else ''}")
-        if waited >= patience:
-            if verbose:
-                print(f"  early stop: no gain for {patience} epochs, best was epoch {max(history, key=lambda h: h['val_map@12'] or -1)['epoch']}")
-            break
+    def best_epoch(self) -> int:
+        return max(self.history, key=lambda h: h["val_map@12"] or -1)["epoch"]
 
-    if best_state is not None:
-        user_tower.load_state_dict(best_state[0])
-        item_tower.load_state_dict(best_state[1])
-    if save_artifacts:
-        write_artifacts(history)
-    if device == "cuda":
-        torch.cuda.empty_cache()
-    return dict(
-        user_tower=user_tower, item_tower=item_tower, item_features=item_features, article_ids=article_ids,
-        customer_index=customer_index, history_sum=history_sum, history_weight=history_weight, static=static,
-        fallback=fallback, device=device, best_val_map=best_map if select_best else None, history=history,
-    )
+    def recommend(self, customers: Iterable[str], fallback: Sequence[int] = ()) -> dict[str, list[int]]:
+        """Top-k articles per customer.
+
+        A candidate retriever asks for far more than the twelve that get shown -
+        the pool is judged on coverage, not on the list it would have displayed.
+        """
+        return self._rank(customers, fallback, self.k)
+
+    def _rank(self, customers, fallback, n: int) -> dict[str, list[int]]:
+        self.user_tower.eval()
+        self.item_tower.eval()
+        item_features = self.item_features
+        with torch.inference_mode():
+            item_vectors = torch.cat(
+                [
+                    self.item_tower(
+                        torch.from_numpy(item_features[i : i + CHUNK]).to(self.device),
+                        torch.arange(i, min(i + CHUNK, len(item_features)), device=self.device),
+                    )
+                    for i in range(0, len(item_features), CHUNK)
+                ]
+            )
+            known = [c for c in customers if c in self.customer_index]
+            rows = np.array([self.customer_index[c] for c in known])
+
+            predictions = {}
+            for start in range(0, len(rows), CHUNK):
+                batch = rows[start : start + CHUNK]
+                features = user_inputs(self.history_sum, self.history_weight, self.customer_attributes, batch)
+                user_vectors = self.user_tower(torch.from_numpy(features).to(self.device))
+                top = (user_vectors @ item_vectors.T).topk(min(n, len(self.article_ids)), dim=1).indices.cpu().numpy()
+                for customer, row in zip(known[start : start + CHUNK], top):
+                    predictions[customer] = [self.article_ids[j] for j in row]
+
+        return {c: predictions.get(c, fallback) for c in customers}
 
 
 def write_artifacts(history: list[dict]) -> None:
-    """Save the training history and its curve next to the model.
+    """Save the training history and its curve to ``results/two_tower/``.
 
     The figure is built through the Figure API rather than pyplot, because
     pyplot would need a backend and switching to a file-writing one changes it
@@ -394,22 +402,20 @@ def main() -> dict:
     because by then the validation week is training data and cannot referee
     anything.
     """
-    tuned = train_model(transactions=load_transactions("train"), select_best=True, save_artifacts=True)
-    chosen = max(tuned["history"], key=lambda h: h["val_map@12"] or -1)["epoch"]
-    print(f"{MODEL_NAME}: early stopping chose epoch {chosen} (val map@12={tuned['best_val_map']:.5f}), refitting on train+val")
+    tuned = TwoTowerRecommender(k=N_RECOMMENDATIONS, select_best=True, verbose=True, save_artifacts=True)
+    tuned.fit(load_transactions("train"))
+    chosen = tuned.best_epoch()
+    print(f"{MODEL_NAME}: early stopping chose epoch {chosen} (val map@12={tuned.best_val_map:.5f}), refitting on train+val")
 
-    trained = train_model(transactions=load_fitting_data(), select_best=False, epochs=chosen, verbose=False)
+    fitting = load_fitting_data()
+    trained = TwoTowerRecommender(k=N_RECOMMENDATIONS, epochs=chosen).fit(fitting)
     ground_truth = purchases_by_customer(load_transactions("test"))
-    predictions = rank(
-        trained["user_tower"], trained["item_tower"], trained["item_features"], ground_truth, trained["customer_index"],
-        trained["article_ids"], trained["history_sum"], trained["history_weight"], trained["static"], trained["fallback"], trained["device"],
-    )
+    predictions = trained.recommend(ground_truth, PopularityRecommender().fit(fitting).ranked)
 
     scores = evaluate(predictions, ground_truth)
     save_result(MODEL_NAME, scores)
-    print(f"{MODEL_NAME}: artifacts in {ARTIFACTS.relative_to(ARTIFACTS.parents[2])}")
-    for k in KS:
-        print(f"  @{k:<4} " + "  ".join(f"{m}={scores[f'{m}@{k}']:.5f}" for m in ("precision", "recall", "hitrate", "ndcg", "map")))
+    print(f"{MODEL_NAME}: artifacts in {ARTIFACTS.relative_to(ROOT)}")
+    print_scores(scores)
     return scores
 
 

@@ -23,23 +23,21 @@ to the sampled customers. The split is written as a ``split`` column so
 downstream scripts filter instead of recomputing dates.
 
 Outputs to ``data/sample/``: transactions.parquet, customers.parquet,
-articles.parquet.
+articles.parquet. Run it with ``python -m src.data.sampling``.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-from pathlib import Path
 
 import polars as pl
+
+from src.paths import RAW, RAW_IMAGES, SAMPLE
 
 WINDOW_DAYS = 140
 CUSTOMER_FRACTION = 0.06
 SEED = 42
 
-ROOT = Path(__file__).resolve().parents[1]
-RAW = ROOT / "data" / "raw"
-OUT = ROOT / "data" / "sample"
 SOURCES = ("transactions_train.csv", "customers.csv", "articles.csv")
 
 
@@ -50,8 +48,8 @@ def check_download() -> None:
             f"Missing {missing} in {RAW}. Download the H&M Personalized Fashion "
             "Recommendations dataset from Kaggle and unzip it there."
         )
-    if not (RAW / "images").is_dir():
-        raise FileNotFoundError(f"Missing image folder at {RAW / 'images'}.")
+    if not RAW_IMAGES.is_dir():
+        raise FileNotFoundError(f"Missing image folder at {RAW_IMAGES}.")
 
 
 def build() -> pl.DataFrame:
@@ -85,15 +83,15 @@ def build() -> pl.DataFrame:
         .collect(engine="streaming")
     )
 
-    OUT.mkdir(parents=True, exist_ok=True)
-    sample.write_parquet(OUT / "transactions.parquet")
+    SAMPLE.mkdir(parents=True, exist_ok=True)
+    sample.write_parquet(SAMPLE / "transactions.parquet")
     (
         pl.scan_csv(RAW / "customers.csv")
         .join(sampled.lazy(), on="customer_id", how="semi")
         .collect(engine="streaming")
-        .write_parquet(OUT / "customers.parquet")
+        .write_parquet(SAMPLE / "customers.parquet")
     )
-    pl.read_csv(RAW / "articles.csv").write_parquet(OUT / "articles.parquet")
+    pl.read_csv(RAW / "articles.csv").write_parquet(SAMPLE / "articles.parquet")
 
     print(f"window        {window_start} .. {last_day} ({WINDOW_DAYS} days)")
     print(f"train         {window_start} .. {val_start - dt.timedelta(days=1)}")

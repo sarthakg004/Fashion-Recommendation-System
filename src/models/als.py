@@ -32,14 +32,13 @@ so the simpler form stays.
 Customers with no training history have no vector at all; they fall back to the
 popularity list from model 1, which is what a production system would do.
 
-Run it directly to score it and append the row to results/metrics_comparison.csv.
+Run it with ``python -m src.models.als`` to score it and append the row to
+results/metrics_comparison.csv.
 """
 
 from __future__ import annotations
 
-import importlib
-import sys
-from pathlib import Path
+from collections.abc import Iterable, Sequence
 
 import numpy as np
 import polars as pl
@@ -48,10 +47,11 @@ from implicit.als import AlternatingLeastSquares
 from implicit.nearest_neighbours import bm25_weight
 from threadpoolctl import threadpool_limits
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from src.data_utils import load_fitting_data, load_transactions, purchases_by_customer
-from src.metrics import KS, evaluate, save_result
+from src.data.loading import days_before_end, load_fitting_data, load_transactions, purchases_by_customer
+from src.evaluation.metrics import KS, evaluate
+from src.evaluation.reporting import print_scores, save_result
+from src.models.base import Recommender
+from src.models.popularity import PopularityRecommender
 
 MODEL_NAME = "02_collaborative_als"
 N_RECOMMENDATIONS = max(KS)
@@ -71,15 +71,15 @@ def build_matrix(train: pl.DataFrame):
     ``TIME_DECAY_ALPHA / (1 + d)``, and repeat purchases of the same article add
     up. Recency is what the decay buys: the same purchase is worth 40x more on
     the last day of the window than on the 40th day back.
+
+    Returns the matrix, the article id of each column, and each customer's row.
     """
     users = train["customer_id"].unique().sort().to_list()
     items = train["article_id"].unique().sort().to_list()
     user_index = {user: i for i, user in enumerate(users)}
     item_index = {item: i for i, item in enumerate(items)}
 
-    days_before_split = train.select(
-        ((pl.lit(train["t_dat"].max()) - pl.col("t_dat")).dt.total_days()).alias("days")
-    )["days"].to_numpy()
+    days_before_split = train.select(days_before_end(train).alias("days"))["days"].to_numpy()
     confidence = (TIME_DECAY_ALPHA / (1.0 + days_before_split)).astype(np.float32)
 
     matrix = sp.csr_matrix(
@@ -93,45 +93,49 @@ def build_matrix(train: pl.DataFrame):
     return matrix, items, user_index
 
 
-def fit(matrix):
-    weighted = bm25_weight(matrix, K1=BM25_K1, B=BM25_B).tocsr()
-    model = AlternatingLeastSquares(
-        factors=FACTORS, regularization=REGULARIZATION, iterations=ITERATIONS, random_state=SEED, num_threads=8
-    )
-    with threadpool_limits(1, "blas"):
-        model.fit(weighted, show_progress=False)
-    return model, weighted
+class AlsRecommender(Recommender):
+    """BM25-weighted, time-decayed ALS over the customer x article matrix."""
 
+    name = "als"
 
-def recommend(model, weighted, customers, items, user_index, fallback) -> dict[str, list[int]]:
-    known = [c for c in customers if c in user_index]
-    rows = np.array([user_index[c] for c in known])
-    ranked, _ = model.recommend(rows, weighted[rows], N=N_RECOMMENDATIONS, filter_already_liked_items=False)
-    personalised = {c: [items[j] for j in row] for c, row in zip(known, ranked)}
-    return {c: personalised.get(c, fallback) for c in customers}
+    def fit(self, train: pl.DataFrame) -> "AlsRecommender":
+        self.matrix, self.items, self.user_index = build_matrix(train)
+        self.weighted = bm25_weight(self.matrix, K1=BM25_K1, B=BM25_B).tocsr()
+        self.model = AlternatingLeastSquares(
+            factors=FACTORS, regularization=REGULARIZATION, iterations=ITERATIONS, random_state=SEED, num_threads=8
+        )
+        with threadpool_limits(1, "blas"):
+            self.model.fit(self.weighted, show_progress=False)
+        return self
+
+    def recommend(self, customers: Iterable[str], fallback: Sequence[int] = ()) -> dict[str, list[int]]:
+        """Top-k articles per customer. ``k`` is capped at the catalog size."""
+        known = [c for c in customers if c in self.user_index]
+        rows = np.array([self.user_index[c] for c in known])
+        ranked, _ = self.model.recommend(
+            rows, self.weighted[rows], N=min(self.k, len(self.items)), filter_already_liked_items=False
+        )
+        personalised = {c: [self.items[j] for j in row] for c, row in zip(known, ranked)}
+        return {c: personalised.get(c, fallback) for c in customers}
 
 
 def main() -> dict:
     train, test = load_fitting_data(), load_transactions("test")
     ground_truth = purchases_by_customer(test)
 
-    matrix, items, user_index = build_matrix(train)
-    model, weighted = fit(matrix)
+    model = AlsRecommender(k=N_RECOMMENDATIONS).fit(train)
+    fallback = PopularityRecommender().fit(train).ranked
 
-    popularity = importlib.import_module("01_popularity")
-    fallback = popularity.top_articles(train)
-
-    predictions = recommend(model, weighted, ground_truth, items, user_index, fallback)
-    covered = sum(1 for c in ground_truth if c in user_index)
+    predictions = model.recommend(ground_truth, fallback)
+    covered = sum(1 for c in ground_truth if c in model.user_index)
     assert all(len(p) == N_RECOMMENDATIONS for p in predictions.values())
 
     scores = evaluate(predictions, ground_truth)
     save_result(MODEL_NAME, scores)
 
-    print(f"{MODEL_NAME}: matrix {matrix.shape} nnz={matrix.nnz:,}")
+    print(f"{MODEL_NAME}: matrix {model.matrix.shape} nnz={model.matrix.nnz:,}")
     print(f"  personalised for {covered:,} / {len(ground_truth):,} test customers ({100 * covered / len(ground_truth):.0f}%), rest fall back to popularity")
-    for k in KS:
-        print(f"  @{k:<4} " + "  ".join(f"{m}={scores[f'{m}@{k}']:.5f}" for m in ("precision", "recall", "hitrate", "ndcg", "map")))
+    print_scores(scores)
     return scores
 
 

@@ -1,9 +1,11 @@
 """Run the two-stage ranker once and cache what the API needs to serve.
 
-Fitting the two-stage model takes several minutes - it refits six retrievers per
+Fitting the two-stage model takes several minutes - it refits both retrievers per
 label week - so it happens here, once, and the API only ever reads parquet. The
 recommendations served are exactly the ones scored in the comparison table; this
 script does not re-rank anything, it just records the output.
+
+Run it from the repository root with ``python -m api.precompute``.
 
 Writes to ``api/artifacts/``:
 
@@ -16,18 +18,18 @@ Writes to ``api/artifacts/``:
 
 from __future__ import annotations
 
-import importlib
+import os
+
+os.environ.setdefault("POLARS_MAX_THREADS", "4")
+
 import json
-import sys
 from pathlib import Path
 
 import polars as pl
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "models"))
-
-from src.data_utils import load_articles, load_fitting_data, load_transactions, purchases_by_customer
+from src.data.loading import load_articles, load_fitting_data, load_transactions
+from src.evaluation.reporting import round_floats
+from src.ranking.two_stage import MODEL_NAME, evaluate_two_stage
 
 ARTIFACTS = Path(__file__).resolve().parent / "artifacts"
 TOP_K = 12
@@ -35,9 +37,8 @@ HISTORY_K = 8
 
 
 def main() -> None:
-    ranker = importlib.import_module("05_two_stage_ranker")
-    result = ranker.run(save=False)
-    predictions = result["predictions"]
+    result = evaluate_two_stage()
+    predictions = result.predictions
 
     recommendations = pl.DataFrame(
         {
@@ -66,7 +67,7 @@ def main() -> None:
         "article_id", "prod_name", "product_type_name", "colour_group_name", "index_name", "detail_desc"
     )
 
-    scores = {"model": ranker.MODEL_NAME, **{k: round(v, 6) if isinstance(v, float) else v for k, v in result["scores"].items()}}
+    scores = {"model": MODEL_NAME, **round_floats(result.scores)}
 
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     recommendations.write_parquet(ARTIFACTS / "recommendations.parquet")

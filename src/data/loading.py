@@ -1,0 +1,97 @@
+"""Shared loading helpers for the sampled dataset.
+
+Every model reads the same parquet files written by ``src/data/sampling.py``, so
+the loading lives here rather than in five copies. The date arithmetic that every
+model repeats - how far a purchase sits from the end of its window, and where a
+given week starts and ends - lives here for the same reason.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+
+import polars as pl
+
+from src.paths import SAMPLE
+
+
+def load_transactions(split: str | None = None) -> pl.DataFrame:
+    """Sampled transactions, optionally one split of ``train`` / ``val`` / ``test``."""
+    path = SAMPLE / "transactions.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found - run python -m src.data.sampling first.")
+    transactions = pl.read_parquet(path)
+    return transactions if split is None else transactions.filter(pl.col("split") == split)
+
+
+def load_fitting_data() -> pl.DataFrame:
+    """Everything a model may learn from before predicting the test week.
+
+    Hyperparameters are chosen on the validation week, and then every model is
+    refitted on train *and* val before it predicts test, which is what a weekly
+    production retrain does. It matters more than it sounds: fitted on train
+    alone, a model's view of the catalog stops a week before the week it is
+    predicting, which halves the repurchase signal (2.0% of test purchases are
+    repeats of a train article, 3.9% of a train-or-val one) and dates the
+    bestseller list (test recall of the last-7-day top 300 goes 0.178 -> 0.223).
+
+    All five models use this, so the comparison stays like for like.
+    """
+    return load_transactions().filter(pl.col("split") != "test")
+
+
+def load_articles() -> pl.DataFrame:
+    return pl.read_parquet(SAMPLE / "articles.parquet")
+
+
+def load_customers() -> pl.DataFrame:
+    return pl.read_parquet(SAMPLE / "customers.parquet")
+
+
+def week_bounds(last_day: dt.date, weeks_back: int = 0) -> tuple[dt.date, dt.date]:
+    """First and last day of the seven-day week ending ``weeks_back`` weeks before ``last_day``."""
+    end = last_day - dt.timedelta(days=7 * weeks_back)
+    return end - dt.timedelta(days=6), end
+
+
+def days_before_end(transactions: pl.DataFrame) -> pl.Expr:
+    """Days between each purchase and the last day of ``transactions``, the input to every recency weight."""
+    return (pl.lit(transactions["t_dat"].max()) - pl.col("t_dat")).dt.total_days()
+
+
+def holdout_split(weeks_back: int = 0, window_weeks: int | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Fitting frame and evaluation week, counted back from the test week.
+
+    ``weeks_back=0`` reproduces the fixed split exactly: everything before the
+    test week to fit on, the test week to score against. Larger values slide
+    both windows one week earlier, which is what lets the whole pipeline be run
+    against several held-out weeks instead of trusting a single one. A metric
+    from one week carries the quirks of that week, and on a fashion catalog
+    those are real: a cold snap or a promotion moves the bestseller list enough
+    to move the score.
+
+    ``window_weeks`` fixes how much history each fold gets instead of letting it
+    grow toward the present. With the default expanding window a later fold has
+    both a different evaluation week and more data to fit on, so "that week was
+    harder" cannot be told apart from "that fold had less to learn from". Holding
+    the window at a fixed number of weeks removes the second difference and
+    leaves only the week.
+    """
+    transactions = load_transactions()
+    start, end = week_bounds(transactions["t_dat"].max(), weeks_back)
+    history = pl.col("t_dat") < start
+    if window_weeks is not None:
+        history = history & (pl.col("t_dat") >= start - dt.timedelta(days=7 * window_weeks))
+    return (
+        transactions.filter(history),
+        transactions.filter((pl.col("t_dat") >= start) & (pl.col("t_dat") <= end)),
+    )
+
+
+def purchases_by_customer(transactions: pl.DataFrame) -> dict[str, list[int]]:
+    """``{customer_id: [article_id, ...]}`` in purchase order.
+
+    Used both for ground truth (test split) and for purchase history (train split).
+    """
+    grouped = transactions.sort("t_dat").group_by("customer_id").agg(pl.col("article_id"))
+    return dict(zip(grouped["customer_id"].to_list(), grouped["article_id"].to_list()))

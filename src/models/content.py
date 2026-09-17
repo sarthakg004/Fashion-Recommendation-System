@@ -25,14 +25,14 @@ exactly the cold-start case ALS cannot reach.
 IMAGE_WEIGHT and IMAGE_ENCODER were chosen on the validation week; see the
 notebook for the sweep.
 
-Run it directly to score it and append the row to results/metrics_comparison.csv.
+Run it with ``python -m src.models.content`` to score it and append the row to
+results/metrics_comparison.csv.
 """
 
 from __future__ import annotations
 
-import importlib
-import sys
-from pathlib import Path
+from collections.abc import Iterable, Sequence
+from functools import cache
 
 import numpy as np
 import polars as pl
@@ -42,10 +42,12 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from src.data_utils import load_articles, load_fitting_data, load_transactions, purchases_by_customer
-from src.metrics import KS, evaluate, save_result
+from src.data.loading import days_before_end, load_articles, load_fitting_data, load_transactions, purchases_by_customer
+from src.evaluation.metrics import KS, evaluate
+from src.evaluation.reporting import print_scores, save_result
+from src.models.base import Recommender
+from src.models.popularity import PopularityRecommender
+from src.paths import embeddings_path
 
 MODEL_NAME = "03_content_based"
 N_RECOMMENDATIONS = max(KS)
@@ -70,11 +72,6 @@ CATEGORICAL = [
 ]
 
 
-def catalog(transactions: pl.DataFrame) -> list[int]:
-    """Every article seen anywhere in the sample, including test-only ones."""
-    return sorted(transactions["article_id"].unique().to_list())
-
-
 def metadata_features(article_ids: list[int]) -> np.ndarray:
     articles = (
         pl.DataFrame({"article_id": article_ids})
@@ -95,9 +92,9 @@ def metadata_features(article_ids: list[int]) -> np.ndarray:
 
 
 def image_features(article_ids: list[int], encoder: str = IMAGE_ENCODER) -> np.ndarray:
-    path = Path(__file__).resolve().parents[1] / "data" / f"image_embeddings_{encoder}.parquet"
+    path = embeddings_path(encoder)
     if not path.exists():
-        raise FileNotFoundError(f"{path} not found - run data/extract_image_embeddings.py first.")
+        raise FileNotFoundError(f"{path} not found - run python -m src.data.image_embeddings first.")
 
     cached = pl.read_parquet(path)
     lookup = dict(zip(cached["article_id"].to_list(), range(cached.height)))
@@ -110,13 +107,26 @@ def image_features(article_ids: list[int], encoder: str = IMAGE_ENCODER) -> np.n
     return features
 
 
+@cache
+def catalog_features(image_encoder: str) -> tuple[list[int], np.ndarray, np.ndarray]:
+    """Article ids, metadata block and image block for the whole catalog, built once per process.
+
+    The catalog is every article seen anywhere in the sample, including test-only
+    ones. These describe articles, not customers, so they are identical for every
+    fit; rebuilding them per fit meant rerunning the metadata SVD several times in
+    a single two-stage run, which cost minutes and a couple of gigabytes.
+    """
+    article_ids = sorted(load_transactions()["article_id"].unique().to_list())
+    return article_ids, metadata_features(article_ids), image_features(article_ids, image_encoder)
+
+
 def customer_profiles(train: pl.DataFrame, article_ids: list[int], blocks: list[np.ndarray]):
     """Recency-weighted average of each customer's purchased article vectors."""
     customers = train["customer_id"].unique().sort().to_list()
     customer_index = {c: i for i, c in enumerate(customers)}
     article_index = {a: i for i, a in enumerate(article_ids)}
 
-    days = train.select(((pl.lit(train["t_dat"].max()) - pl.col("t_dat")).dt.total_days()).alias("d"))["d"].to_numpy()
+    days = train.select(days_before_end(train).alias("d"))["d"].to_numpy()
     weights = sp.csr_matrix(
         (
             (1.0 / (1.0 + days)).astype(np.float32),
@@ -128,49 +138,60 @@ def customer_profiles(train: pl.DataFrame, article_ids: list[int], blocks: list[
     return [normalize(weights @ block).astype(np.float32) for block in blocks], customer_index
 
 
-def recommend(profiles, item_blocks, weights, customers, customer_index, article_ids, fallback) -> dict[str, list[int]]:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    items = [torch.from_numpy(block).to(device) for block in item_blocks]
-    known = [c for c in customers if c in customer_index]
-    rows = np.array([customer_index[c] for c in known])
+class ContentRecommender(Recommender):
+    """Nearest catalog articles to a customer's recency-weighted purchase profile."""
 
-    predictions = {}
-    for start in range(0, len(rows), CHUNK):
-        batch = rows[start : start + CHUNK]
-        scores = sum(
-            weight * (torch.from_numpy(profile[batch]).to(device) @ item.T)
-            for weight, profile, item in zip(weights, profiles, items)
-        )
-        top = scores.topk(N_RECOMMENDATIONS, dim=1).indices.cpu().numpy()
-        for customer, row in zip(known[start : start + CHUNK], top):
-            predictions[customer] = [article_ids[j] for j in row]
+    name = "content"
 
-    return {c: predictions.get(c, fallback) for c in customers}
+    def __init__(self, k: int | None = None, image_encoder: str = IMAGE_ENCODER, image_weight: float = IMAGE_WEIGHT):
+        super().__init__(k)
+        self.image_encoder = image_encoder
+        self.image_weight = image_weight
+
+    def fit(self, train: pl.DataFrame) -> "ContentRecommender":
+        self.article_ids, metadata, image = catalog_features(self.image_encoder)
+        self.blocks = [metadata, image]
+        self.weights = [1.0 - self.image_weight, self.image_weight]
+        self.profiles, self.customer_index = customer_profiles(train, self.article_ids, self.blocks)
+        return self
+
+    def recommend(self, customers: Iterable[str], fallback: Sequence[int] = ()) -> dict[str, list[int]]:
+        """Top-k articles per customer. ``k`` is capped at the catalog size."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        items = [torch.from_numpy(block).to(device) for block in self.blocks]
+        known = [c for c in customers if c in self.customer_index]
+        rows = np.array([self.customer_index[c] for c in known])
+
+        predictions = {}
+        for start in range(0, len(rows), CHUNK):
+            batch = rows[start : start + CHUNK]
+            scores = sum(
+                weight * (torch.from_numpy(profile[batch]).to(device) @ item.T)
+                for weight, profile, item in zip(self.weights, self.profiles, items)
+            )
+            top = scores.topk(min(self.k, len(self.article_ids)), dim=1).indices.cpu().numpy()
+            for customer, row in zip(known[start : start + CHUNK], top):
+                predictions[customer] = [self.article_ids[j] for j in row]
+
+        return {c: predictions.get(c, fallback) for c in customers}
 
 
 def main(image_encoder: str = IMAGE_ENCODER, image_weight: float = IMAGE_WEIGHT, split: str = "test") -> dict:
     train, held_out = (load_fitting_data() if split == "test" else load_transactions("train")), load_transactions(split)
     ground_truth = purchases_by_customer(held_out)
 
-    article_ids = catalog(load_transactions())
-    blocks = [metadata_features(article_ids), image_features(article_ids, image_encoder)]
-    profiles, customer_index = customer_profiles(train, article_ids, blocks)
-
-    popularity = importlib.import_module("01_popularity")
-    predictions = recommend(
-        profiles, blocks, [1.0 - image_weight, image_weight], ground_truth, customer_index, article_ids, popularity.top_articles(train)
-    )
+    model = ContentRecommender(k=N_RECOMMENDATIONS, image_encoder=image_encoder, image_weight=image_weight).fit(train)
+    predictions = model.recommend(ground_truth, PopularityRecommender().fit(train).ranked)
 
     scores = evaluate(predictions, ground_truth)
     if split == "test":
         save_result(MODEL_NAME, scores)
 
-    cold_start = set(article_ids) - set(train["article_id"].unique().to_list())
+    cold_start = set(model.article_ids) - set(train["article_id"].unique().to_list())
     surfaced = {a for items in predictions.values() for a in items[:12]} & cold_start
-    print(f"{MODEL_NAME}: {len(article_ids):,} candidate articles ({len(cold_start):,} never sold before the test week)")
+    print(f"{MODEL_NAME}: {len(model.article_ids):,} candidate articles ({len(cold_start):,} never sold before the test week)")
     print(f"  cold-start articles surfaced in a top-12: {len(surfaced):,}")
-    for k in KS:
-        print(f"  @{k:<4} " + "  ".join(f"{m}={scores[f'{m}@{k}']:.5f}" for m in ("precision", "recall", "hitrate", "ndcg", "map")))
+    print_scores(scores)
     return scores
 
 
