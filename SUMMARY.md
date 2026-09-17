@@ -50,7 +50,7 @@ earlier in the project and remains the largest win in it.
 | 5 | Two-stage | pools candidates from two retrievers, reranks with LightGBM LambdaRank |
 
 Model 5 is the final system: `RecentBestsellers(k=700)` plus
-`TwoTowerRetriever(k=700)` produce about 1,055 candidates per customer, and a
+`TwoTowerRecommender(k=700)` produce about 1,054 candidates per customer, and a
 LambdaRank model with 17 features orders them. It trains on four rolling-origin
 label weeks with 60 negatives per customer and 600 trees.
 
@@ -63,24 +63,30 @@ Test week, 4,155 customers, all five models identical evaluation.
 | 01 popularity | 0.00350 | 0.03201 | 0.00715 | 0.04052 |
 | 02 ALS | 0.02434 | 0.09338 | 0.03547 | 0.09462 |
 | 03 content | 0.01833 | 0.06065 | 0.02492 | 0.07272 |
-| 04 two-tower | 0.01970 | 0.08688 | 0.03013 | 0.13525 |
-| 05 two-stage | **0.03121** | **0.13141** | **0.04694** | **0.17718** |
+| 04 two-tower | 0.02015 | 0.08785 | 0.03060 | 0.13530 |
+| 05 two-stage | **0.03011** | **0.12756** | **0.04513** | **0.17671** |
 
-**The 0.03121 is not stable.** Eight recorded runs of this exact configuration on
-this exact week span 0.02925 to 0.03121, mean 0.02980, standard deviation
-0.00062. The cause is GPU non-determinism in the two-tower, which is retrained
-once per label week and feeds the candidate pool. Models 1, 2 and 3 are fully
-deterministic and reproduce byte-identically; models 4 and 5 do not.
+**The 0.03011 is not stable.** Twelve recorded runs of this exact configuration on
+this exact week now span 0.02925 to 0.03121: the eight noted in the previous round
+(mean 0.02980, standard deviation 0.00062) plus four on 2026-09-17 while checking
+the refactor, 0.03070 from the pre-refactor code and 0.03029, 0.03011 and 0.02939
+(the `api.precompute` run) from the refactored code. All twelve average about
+**0.02991**, and the spread is still roughly 0.0006. The cause is GPU non-determinism in the two-tower, which is
+retrained once per label week and feeds the candidate pool. Models 1, 2 and 3 are
+fully deterministic and reproduce byte-identically; models 4 and 5 do not.
 
-Consequence: the run currently in the table is the **highest of the eight**.
-Quoting it gives "+28% over ALS"; the mean gives **+22%**, which is the honest
-figure.
+Consequence: the run currently in the table sits a little above the mean, no longer
+at the top of the range. Quoting it gives "+24% over ALS"; the mean of all twelve
+gives **+23%**, which is the honest figure. The README quotes the table run and
+computes its noise estimate from the eight runs whose individual values are
+recorded (standard deviation 0.00063).
 
 ## 5. What the last two rounds added
 
 ### 5.1 A real bug, fixed
 
-`AlsRetriever` and `ContentRetriever` asked their underlying model for 100
+`AlsRetriever` and `ContentRetriever` (since folded into `AlsRecommender` and
+`ContentRecommender`) asked their underlying model for 100
 candidates and then sliced to `k`. Any `k` above 100 silently returned 100. Not
 active, since the default pool no longer uses them, but it made every earlier
 experiment that repooled them meaningless. Both now pass `k` through. Verified:
@@ -93,10 +99,11 @@ gave a candidate. Reading it out in that order scores retrieval alone.
 
 | stage | MAP@12 | R@12 | NDCG@12 | Hit@12 | R@100 |
 |---|---|---|---|---|---|
-| 1. retrieval, pool order | 0.01616 | 0.04433 | 0.02716 | 0.09170 | 0.15234 |
-| 2. reranked | 0.03121 | 0.06950 | 0.04694 | 0.13141 | 0.17718 |
+| 1. retrieval, pool order | 0.01614 | 0.04443 | 0.02726 | 0.09122 | 0.15413 |
+| 2. reranked | 0.03011 | 0.06591 | 0.04513 | 0.12756 | 0.17671 |
 
-The ranker is worth **+93%** on MAP@12 over the pool's own ordering. The pool
+The ranker is worth **+87%** on MAP@12 over the pool's own ordering (+93% in the
+previous run; this moves with the noise above). The pool
 makes **47.5%** of test purchases reachable and the ranker converts **37%** of
 that into recall@100.
 
@@ -108,11 +115,12 @@ Split by how much history the model had on them.
 
 | segment | customers | MAP@12 | R@100 |
 |---|---|---|---|
-| cold, no history | 848 | 0.00955 | 0.10617 |
-| light, 1-4 | 725 | 0.03785 | 0.17805 |
-| heavy, 5+ | 2,582 | 0.03646 | 0.20027 |
+| cold, no history | 848 | 0.01140 | 0.11188 |
+| light, 1-4 | 725 | 0.03817 | 0.17742 |
+| heavy, 5+ | 2,582 | 0.03399 | 0.19780 |
 
-Two findings. Cold customers score about a quarter of the others, and they are
+Two findings. Cold customers score about a third of the others (a quarter in the
+previous run), and they are
 20% of the test set, so a fifth of the evaluation is effectively measuring the
 bestseller list. And light buyers slightly beat heavy ones on MAP@12 while losing
 on recall@100, because MAP divides by how much the customer bought: a heavy buyer
@@ -124,16 +132,16 @@ These numbers move a few points between runs, same non-determinism as above.
 
 | measure | value | meaning |
 |---|---|---|
-| coverage@12 | 0.0407 | share of the 28,086 articles appearing in anyone's top 12 |
-| novelty@12 | 12.88 bits | how un-obvious the recommended articles are |
-| diversity@12 | 0.405 | distinct product types within one list of 12, over 12 |
+| coverage@12 | 0.0405 | share of the 28,086 articles appearing in anyone's top 12 |
+| novelty@12 | 12.91 bits | how un-obvious the recommended articles are |
+| diversity@12 | 0.407 | distinct product types within one list of 12, over 12 |
 
 Coverage of 4% is the interesting one: the system recommends about 1,140 distinct
 articles across 4,155 customers. Accuracy metrics cannot see this.
 
 ### 5.5 Cross-validation
 
-`src/validation.py`, `RollingOriginValidator`. Four held-out weeks by three seeds,
+`src/evaluation/cross_validation.py`, `RollingOriginValidator`. Four held-out weeks by three seeds,
 twelve full pipeline runs, nothing shared between folds.
 
 | fold | evaluates | mean MAP@12 |
@@ -195,11 +203,8 @@ Worth keeping because they are what makes the conclusion credible.
 
 ### 5.8 Infrastructure
 
-- `run()` writes `results/two_stage_report.json` with every number the README
-  quotes about the final model.
-- The README has **8 generated blocks** rewritten from `results/` by a script,
-  with assertions against doubled pipes and ragged rows. The README had twice
-  drifted from the results file before this.
+- `evaluate_two_stage(save=True)` writes `results/two_stage_report.json` with
+  every number the README quotes about the final model.
 - Fixed `RollingOriginValidator.save`, which hardcoded the summary filename and
   so overwrote the expanding summary with the sliding one.
 
@@ -214,35 +219,62 @@ All of these were in the README or docstrings, all wrong against the code:
 - "0.17% positives" that is 0.13%
 - a CLIP paragraph duplicated verbatim
 
+### 5.10 Structure refactor
+
+The code was reorganised into `src/data`, `src/models`, `src/ranking` and
+`src/evaluation` without changing any implementation. Every model now implements
+one `Recommender` interface (`fit`, `recommend`), which removed the three retriever
+wrappers and every `sys.path` / `importlib` workaround. Checked against the
+pre-refactor code:
+
+- models 1-3 reproduce `results/metrics_comparison.csv` byte-identically
+- the rebuilt sample and the two-tower's inputs are identical
+- from frozen retriever outputs, model 5's pool, labels, downsampling, features,
+  LightGBM scores, predictions and every metric are identical
+- the API returns identical bytes on every endpoint
+- the full model 5 run peaks at 5.5 GB against 6.1 GB before, and both land inside
+  the noise band above
+
+Documentation drift found along the way and corrected: the README's CV table had
+its seed columns mislabelled; "four of the five strongest features are new" is
+three; `n_sources` is the weakest feature, not a strong committee signal; the
+notebook's per-retriever ceilings were 0.22 and 0.14 against a measured 0.35 and
+0.32; and the notebook put the two-tower's recall@100 at 0.081 when it is the best
+single model at 0.135.
+
 ## 6. Open issues
 
 1. **The reported model 5 row is whichever run last executed**, so it moves on
-   every notebook rebuild. Currently sitting on the luckiest of eight. Fix is to
-   pin it to the mean of recorded runs. **Not done, awaiting a decision.**
-2. **The API artifacts are from a different run** (0.02984) than the results file
-   (0.03121). Each is internally consistent, but they do not match each other.
+   every notebook rebuild. Currently 0.03011, slightly above the mean of twelve
+   recorded runs. Fix is to pin it to the mean of recorded runs. **Not done,
+   awaiting a decision.**
+2. **The API artifacts come from their own run.** `api.precompute` retrains the
+   pipeline, so the served predictions (0.02939, refreshed 2026-09-17) are a
+   different draw from the results file (0.03011). Each is internally consistent;
+   they can only match exactly if one run writes both.
 3. **Two-tower variance is larger than the two-stage variance** and propagates
    into it. Never characterised on its own.
-4. **No tests.** Declined deliberately. `src/metrics.py` has a `_self_check`.
+4. **No tests.** Declined deliberately. `src/evaluation/metrics.py` has a `_self_check`.
 5. **Sliding window not adopted** despite being worth about +4%.
 
 ## 7. What I would cut from the README
 
-The README is **719 lines**. The measurement material added in the last two
-rounds is **about 210 of them**, and it is the densest, least readable part.
+The README is **784 lines**, 765 before the refactor added the new layout and run
+commands. The measurement material is **about 190 of them**,
+and it is the densest, least readable part.
 
 | section | lines | verdict |
 |---|---|---|
 | `#### What each stage is worth` | 16 | **keep** — answers "why two stages", cheapest high value in the file |
 | `#### Who the model actually helps` | 25 | **keep, trim to ~12** — the cold/light/heavy table earns its place, the explanation around it does not need three paragraphs |
-| `#### What the recommendations look like` | 41 | **cut to ~8** — keep the coverage number in one sentence, drop novelty and diversity. Novelty in bits is not something a reader can calibrate |
-| `## How solid are these numbers` | **127** | **cut to ~30** — this is the bloat. See below |
-| `## What these numbers actually mean` | 22 | keep, it is good context |
+| `#### How much of the catalog it actually uses` | 23 | **cut to ~8** — keep the coverage number in one sentence, drop novelty and diversity. Novelty in bits is not something a reader can calibrate |
+| `## How much should you trust these numbers?` | **117** | **cut to ~30** — this is the bloat. See below |
+| `## What these numbers actually mean` | 24 | keep, it is good context |
 
-**Specifically for the 127-line validation section**, the three things genuinely
+**Specifically for the 117-line validation section**, the three things genuinely
 worth stating are:
 
-1. Run-to-run noise is 0.0006, so differences under about 0.0012 are meaningless.
+1. Run-to-run noise is 0.0006, so differences under about 0.0013 are meaningless.
 2. Across four weeks the model scores 0.0262 on average and the reported week is
    the best of them.
 3. The week matters ten times more than the seed, which is why tuning stopped.
@@ -252,30 +284,44 @@ confound discussion, the sliding-window table, the rejected hypotheses — is
 genuinely interesting and belongs in the **notebook**, where a reader who wants
 it can find it, rather than in a README someone skims in two minutes.
 
-That would take the README from 719 lines to roughly **560**, with nothing lost
+That would take the README from 784 lines to roughly **670**, with nothing lost
 that a recruiter or interviewer would miss.
 
 ## 8. Layout
 
 ```
-data/          sampling, image embedding extraction
-src/           metrics.py, data_utils.py, retrievers.py, validation.py
-models/        01..05, one file per model
+src/paths.py   every location on disk
+src/data/      loading, sampling, image embedding extraction
+src/models/    Recommender base class, models 1-4, heuristic retrievers
+src/ranking/   model 5: candidate pool, features, TwoStageRanker
+src/evaluation/ metrics, reporting, cross-validation
+data/          raw download, sample, cached embeddings (no code)
 results/       metrics_comparison.csv, two_stage_report.json,
-               cross_validation*.csv
+               cross_validation*.csv, two_tower/ training curve
 notebooks/     end_to_end.ipynb — 76 cells, 22 figures
 api/ web/      FastAPI service and React front end
-docs/images/   13 figures, all exported from the notebook
+docs/images/   15 figures: 14 exported from the notebook, plus the web app screenshot
 ```
 
 | file | lines |
 |---|---|
-| `models/05_two_stage_ranker.py` | 568 |
-| `models/04_two_tower.py` | 417 |
-| `src/retrievers.py` | 241 |
-| `src/metrics.py` | 187 |
-| `src/validation.py` | 130 |
-| `src/data_utils.py` | 83 |
+| `src/models/two_tower.py` | 423 |
+| `src/ranking/two_stage.py` | 381 |
+| `src/models/content.py` | 199 |
+| `src/ranking/features.py` | 167 |
+| `src/evaluation/metrics.py` | 164 |
+| `src/evaluation/cross_validation.py` | 144 |
+| `src/models/als.py` | 143 |
+| `src/ranking/candidates.py` | 111 |
+| `src/data/loading.py` | 97 |
+| `src/models/heuristics.py` | 92 |
+| `src/models/popularity.py` | 90 |
+| `src/evaluation/reporting.py` | 73 |
+| `src/models/base.py` | 40 |
+
+Every script runs from the repository root as a module, e.g.
+`python -m src.ranking.two_stage`. The five models share one `Recommender`
+interface, so the two-stage pool uses them directly instead of through wrappers.
 
 ## 9. Commits in these rounds
 
@@ -288,9 +334,9 @@ a442121  Rebuild the two-tower and repool retrieval around it
 
 ## 10. For the resume
 
-Quote **+22% MAP@12** and **+85% Recall@100** over ALS. Both are computed against
-the mean of recorded runs, not the single lucky one currently in the table. The
-run sitting in the table right now would say +28% and +87%; those are the top of
-the range, not the middle.
+Quote **+23% MAP@12** and **+85% Recall@100** over ALS. Both are computed against
+the mean of recorded runs (twelve for MAP@12, the six with recall@100 recorded for
+Recall@100), not the single run currently in the table. The run sitting in the table
+right now would say +24% and +87%, a little above the middle of the range.
 Metrics to name: MAP@12, Recall@100, NDCG@12, hit rate. Do not quote absolute
 values.

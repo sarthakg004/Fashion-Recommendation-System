@@ -1,25 +1,25 @@
 """Shared loading helpers for the sampled dataset.
 
-Every model script reads the same three parquet files written by
-``data/sample_data.py``, so the loading lives here rather than in five copies.
+Every model reads the same parquet files written by ``src/data/sampling.py``, so
+the loading lives here rather than in five copies. The date arithmetic that every
+model repeats - how far a purchase sits from the end of its window, and where a
+given week starts and ends - lives here for the same reason.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-from pathlib import Path
 
 import polars as pl
 
-ROOT = Path(__file__).resolve().parents[1]
-SAMPLE = ROOT / "data" / "sample"
+from src.paths import SAMPLE
 
 
 def load_transactions(split: str | None = None) -> pl.DataFrame:
     """Sampled transactions, optionally one split of ``train`` / ``val`` / ``test``."""
     path = SAMPLE / "transactions.parquet"
     if not path.exists():
-        raise FileNotFoundError(f"{path} not found - run data/sample_data.py first.")
+        raise FileNotFoundError(f"{path} not found - run python -m src.data.sampling first.")
     transactions = pl.read_parquet(path)
     return transactions if split is None else transactions.filter(pl.col("split") == split)
 
@@ -40,7 +40,26 @@ def load_fitting_data() -> pl.DataFrame:
     return load_transactions().filter(pl.col("split") != "test")
 
 
-def split_at(weeks_back: int = 0, window_weeks: int | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
+def load_articles() -> pl.DataFrame:
+    return pl.read_parquet(SAMPLE / "articles.parquet")
+
+
+def load_customers() -> pl.DataFrame:
+    return pl.read_parquet(SAMPLE / "customers.parquet")
+
+
+def week_bounds(last_day: dt.date, weeks_back: int = 0) -> tuple[dt.date, dt.date]:
+    """First and last day of the seven-day week ending ``weeks_back`` weeks before ``last_day``."""
+    end = last_day - dt.timedelta(days=7 * weeks_back)
+    return end - dt.timedelta(days=6), end
+
+
+def days_before_end(transactions: pl.DataFrame) -> pl.Expr:
+    """Days between each purchase and the last day of ``transactions``, the input to every recency weight."""
+    return (pl.lit(transactions["t_dat"].max()) - pl.col("t_dat")).dt.total_days()
+
+
+def holdout_split(weeks_back: int = 0, window_weeks: int | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Fitting frame and evaluation week, counted back from the test week.
 
     ``weeks_back=0`` reproduces the fixed split exactly: everything before the
@@ -59,8 +78,7 @@ def split_at(weeks_back: int = 0, window_weeks: int | None = None) -> tuple[pl.D
     leaves only the week.
     """
     transactions = load_transactions()
-    end = transactions["t_dat"].max() - dt.timedelta(days=7 * weeks_back)
-    start = end - dt.timedelta(days=6)
+    start, end = week_bounds(transactions["t_dat"].max(), weeks_back)
     history = pl.col("t_dat") < start
     if window_weeks is not None:
         history = history & (pl.col("t_dat") >= start - dt.timedelta(days=7 * window_weeks))
@@ -68,10 +86,6 @@ def split_at(weeks_back: int = 0, window_weeks: int | None = None) -> tuple[pl.D
         transactions.filter(history),
         transactions.filter((pl.col("t_dat") >= start) & (pl.col("t_dat") <= end)),
     )
-
-
-def load_articles() -> pl.DataFrame:
-    return pl.read_parquet(SAMPLE / "articles.parquet")
 
 
 def purchases_by_customer(transactions: pl.DataFrame) -> dict[str, list[int]]:

@@ -13,16 +13,15 @@ without re-running anything:
 Embeddings are L2-normalised, so downstream cosine similarity is a plain dot
 product. Outputs are written per encoder to
 ``data/image_embeddings_{name}.parquet`` with columns ``article_id`` and
-``embedding``; an existing file is left alone unless ``FORCE`` is set.
+``embedding``; an existing file is left alone unless ``--force`` is passed.
 
 The cache is keyed to the article list in ``data/sample``, so re-run this whenever
-the sample is rebuilt.
+the sample is rebuilt. Run it with ``python -m src.data.image_embeddings``.
 """
 
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 import polars as pl
 import torch
@@ -30,24 +29,13 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models import ResNet18_Weights, resnet18
 
+from src.paths import RAW_IMAGES, SAMPLE, embeddings_path, image_path
+
 BATCH_SIZE = 256
 NUM_WORKERS = 8
 MAX_MISSING_FRACTION = 0.05
 CLIP_ARCH = "ViT-B-32"
 CLIP_WEIGHTS = "laion2b_s34b_b79k"
-
-ROOT = Path(__file__).resolve().parents[1]
-IMAGES = ROOT / "data" / "raw" / "images"
-SAMPLE = ROOT / "data" / "sample" / "transactions.parquet"
-
-
-def output_path(encoder: str) -> Path:
-    return ROOT / "data" / f"image_embeddings_{encoder}.parquet"
-
-
-def image_path(article_id: int) -> Path:
-    name = f"{article_id:010d}"
-    return IMAGES / name[:3] / f"{name}.jpg"
 
 
 def load_resnet18(device: str):
@@ -84,15 +72,16 @@ class ArticleImages(Dataset):
 
 
 def sampled_articles() -> list[int]:
-    if not SAMPLE.exists():
-        raise FileNotFoundError(f"{SAMPLE} not found - run data/sample_data.py first.")
-    article_ids = sorted(pl.read_parquet(SAMPLE, columns=["article_id"])["article_id"].unique().to_list())
+    transactions = SAMPLE / "transactions.parquet"
+    if not transactions.exists():
+        raise FileNotFoundError(f"{transactions} not found - run python -m src.data.sampling first.")
+    article_ids = sorted(pl.read_parquet(transactions, columns=["article_id"])["article_id"].unique().to_list())
 
     present = [a for a in article_ids if image_path(a).exists()]
     missing = len(article_ids) - len(present)
     if missing > MAX_MISSING_FRACTION * len(article_ids):
         raise RuntimeError(
-            f"{missing:,} of {len(article_ids):,} sampled articles have no photo under {IMAGES}. "
+            f"{missing:,} of {len(article_ids):,} sampled articles have no photo under {RAW_IMAGES}. "
             "That is more than expected - check the image folder layout."
         )
     print(f"{len(present):,} sampled articles with photos ({missing:,} without)")
@@ -100,7 +89,7 @@ def sampled_articles() -> list[int]:
 
 
 def extract(encoder: str = "resnet18", force: bool = False) -> pl.DataFrame:
-    out = output_path(encoder)
+    out = embeddings_path(encoder)
     if out.exists() and not force:
         print(f"{out.name} already cached, skipping")
         return pl.read_parquet(out)

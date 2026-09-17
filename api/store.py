@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 
 import polars as pl
 
-ROOT = Path(__file__).resolve().parents[1]
-IMAGES = ROOT / "data" / "raw" / "images"
+from src import paths
 
 
 @dataclass(frozen=True)
@@ -32,7 +32,7 @@ class RecommendationStore:
     def __init__(self, artifacts: Path | None = None):
         self.artifacts = artifacts or Path(__file__).resolve().parent / "artifacts"
         if not (self.artifacts / "recommendations.parquet").exists():
-            raise FileNotFoundError(f"No artifacts in {self.artifacts} - run python api/precompute.py first.")
+            raise FileNotFoundError(f"No artifacts in {self.artifacts} - run python -m api.precompute first.")
 
     def _grouped(self, name: str) -> dict[str, list[int]]:
         frame = pl.read_parquet(self.artifacts / f"{name}.parquet")
@@ -70,8 +70,6 @@ class RecommendationStore:
 
     @cached_property
     def metrics(self) -> dict:
-        import json
-
         return json.loads((self.artifacts / "metrics.json").read_text())
 
     @cached_property
@@ -138,6 +136,5 @@ class RecommendationStore:
         }
 
     def image_path(self, article_id: int) -> Path | None:
-        name = f"{article_id:010d}"
-        path = IMAGES / name[:3] / f"{name}.jpg"
+        path = paths.image_path(article_id)
         return path if path.exists() else None

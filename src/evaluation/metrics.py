@@ -1,7 +1,7 @@
 """Shared ranking metrics for every Aurora model.
 
 Every model emits predictions in the same shape, so this module is imported
-unmodified by all five model scripts:
+unmodified by all five models:
 
     predictions   {customer_id: [article_id, ...]}  ranked best first
     ground_truth  {customer_id: [article_id, ...]}  test-week purchases
@@ -15,13 +15,10 @@ reach 1.0.
 
 from __future__ import annotations
 
-import csv
 import math
-from pathlib import Path
 
 KS = (12, 50, 100)
 METRICS = ("precision", "recall", "hitrate", "ndcg", "map")
-RESULTS_PATH = Path(__file__).resolve().parents[1] / "results" / "metrics_comparison.csv"
 
 
 def _dcg(gains) -> float:
@@ -129,26 +126,6 @@ def beyond_accuracy(predictions, popularity, category_of, catalog_size, k=12) ->
         f"novelty@{k}": novelty / n,
         f"diversity@{k}": diversity / n,
     }
-
-
-def save_result(model_name: str, scores: dict, path: Path = RESULTS_PATH) -> Path:
-    """Upsert one model's row into the shared comparison file."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    row = {"model": model_name, **{k: round(v, 6) if isinstance(v, float) else v for k, v in scores.items()}}
-    rows = []
-    if path.exists():
-        with path.open() as f:
-            rows = [r for r in csv.DictReader(f) if r["model"] != model_name]
-    rows.append(row)
-    rows.sort(key=lambda r: r["model"])
-
-    with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row))
-        writer.writeheader()
-        writer.writerows(rows)
-    return path
 
 
 def _self_check() -> None:
