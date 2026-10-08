@@ -22,8 +22,15 @@ it:
 to the sampled customers. The split is written as a ``split`` column so
 downstream scripts filter instead of recomputing dates.
 
+Sampling customers is a way to make training cheap, not a claim that the shop only
+knows about 6% of its sales. ``article_sales.parquet`` keeps every customer's
+purchases inside the window, summed per article per day, and it is where the
+bestseller lists, the article statistics and the list of articles on sale come
+from. Counted over the sample alone, last week's bestsellers rest on about 15,000
+purchases; over the store they rest on about 250,000.
+
 Outputs to ``data/sample/``: transactions.parquet, customers.parquet,
-articles.parquet. Run it with ``python -m src.data.sampling``.
+articles.parquet, article_sales.parquet. Run it with ``python -m src.data.sampling``.
 """
 
 from __future__ import annotations
@@ -52,15 +59,38 @@ def check_download() -> None:
         raise FileNotFoundError(f"Missing image folder at {RAW_IMAGES}.")
 
 
-def build() -> pl.DataFrame:
+def scan_window() -> tuple[pl.LazyFrame, dt.date, dt.date]:
+    """Every transaction inside the window, with its first and last day."""
     transactions = pl.scan_csv(RAW / "transactions_train.csv", schema_overrides={"t_dat": pl.Date})
-
     last_day = transactions.select(pl.col("t_dat").max()).collect(engine="streaming").item()
     window_start = last_day - dt.timedelta(days=WINDOW_DAYS - 1)
+    return transactions.filter(pl.col("t_dat") >= window_start), window_start, last_day
+
+
+def build_article_sales() -> pl.DataFrame:
+    """Store-wide sales per article per day inside the window, from every customer."""
+    window, _, _ = scan_window()
+    sales = (
+        window.group_by("t_dat", "article_id")
+        .agg(
+            pl.len().cast(pl.Int64).alias("sales"),
+            pl.col("price").sum().alias("revenue"),
+        )
+        .sort("t_dat", "article_id")
+        .collect(engine="streaming")
+    )
+    SAMPLE.mkdir(parents=True, exist_ok=True)
+    sales.write_parquet(SAMPLE / "article_sales.parquet")
+    print(f"article sales {sales.height:,} article-days, {sales['article_id'].n_unique():,} articles, "
+          f"{sales['sales'].sum():,} purchases")
+    return sales
+
+
+def build() -> pl.DataFrame:
+    window, window_start, last_day = scan_window()
     val_start = last_day - dt.timedelta(days=13)
     test_start = last_day - dt.timedelta(days=6)
 
-    window = transactions.filter(pl.col("t_dat") >= window_start)
     sampled = (
         window.select("customer_id")
         .unique()
@@ -107,3 +137,4 @@ def build() -> pl.DataFrame:
 if __name__ == "__main__":
     check_download()
     build()
+    build_article_sales()

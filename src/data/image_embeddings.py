@@ -1,60 +1,41 @@
-"""Cache one image embedding per sampled article, using frozen pretrained encoders.
+"""Cache one Marqo-FashionSigLIP embedding per sampled article photo.
 
-This is preprocessing, not a model: both encoders run inference only, no
-fine-tuning. Two are cached side by side so models 3 and 4 can be tried on either
-without re-running anything:
-
-    resnet18  ImageNet-supervised ResNet-18, classifier head removed, 512-dim.
-              Cheap, and its similarity is dominated by shape and colour.
-    clip      OpenCLIP ViT-B/32 (LAION-2B), image tower only, 512-dim. Trained on
-              image-text pairs, so its similarity tracks how a garment would be
-              described, not only how it looks.
+This is preprocessing, not a model: the encoder runs inference only, no
+fine-tuning. Marqo-FashionSigLIP is a CLIP-style pair of encoders (ViT-B/16 SigLIP)
+trained on fashion product images and their text; this module caches its image
+tower, 768-dim, and ``src/data/text_embeddings.py`` caches its text tower. ResNet-18
+and a general-purpose CLIP were compared against it and are documented in the
+README; neither is used.
 
 Embeddings are L2-normalised, so downstream cosine similarity is a plain dot
-product. Outputs are written per encoder to
-``data/image_embeddings_{name}.parquet`` with columns ``article_id`` and
-``embedding``; an existing file is left alone unless ``--force`` is passed.
+product. The photo loaders are spawned rather than forked: a forked worker starts
+as a copy of a process already holding the model, and four of those ran out of
+memory under a 3.5 GB cap. The output is ``data/image_embeddings_fashion_siglip.parquet`` with columns
+``article_id`` and ``embedding``; an existing file is left alone unless ``--force``
+is passed.
 
-The cache is keyed to the article list in ``data/sample``, so re-run this whenever
-the sample is rebuilt. Run it with ``python -m src.data.image_embeddings``.
+The cache covers every article anyone bought inside the window
+(``src.data.loading.catalog``), not only the ones the sample bought, because any of
+them can be recommended once it has sold. Re-run this whenever the sample is rebuilt. Run it with ``python -m src.data.image_embeddings``.
 """
 
 from __future__ import annotations
 
 import sys
 
+import open_clip
 import polars as pl
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models import ResNet18_Weights, resnet18
 
-from src.paths import RAW_IMAGES, SAMPLE, embeddings_path, image_path
+from src.data.loading import catalog
+from src.paths import IMAGE_EMBEDDINGS, RAW_IMAGES, image_path
 
-BATCH_SIZE = 256
-NUM_WORKERS = 8
+BATCH_SIZE = 128
+NUM_WORKERS = 4
 MAX_MISSING_FRACTION = 0.05
-CLIP_ARCH = "ViT-B-32"
-CLIP_WEIGHTS = "laion2b_s34b_b79k"
-
-
-def load_resnet18(device: str):
-    weights = ResNet18_Weights.IMAGENET1K_V1
-    model = resnet18(weights=weights)
-    model.fc = torch.nn.Identity()
-    model.eval().to(device)
-    return model, weights.transforms()
-
-
-def load_clip(device: str):
-    import open_clip
-
-    model, _, preprocess = open_clip.create_model_and_transforms(CLIP_ARCH, pretrained=CLIP_WEIGHTS)
-    model.eval().to(device)
-    return model.encode_image, preprocess
-
-
-ENCODERS = {"resnet18": load_resnet18, "clip": load_clip}
+FASHION_SIGLIP = "hf-hub:Marqo/marqo-fashionSigLIP"
 
 
 class ArticleImages(Dataset):
@@ -71,37 +52,36 @@ class ArticleImages(Dataset):
             return self.transform(img.convert("RGB")), article_id
 
 
-def sampled_articles() -> list[int]:
-    transactions = SAMPLE / "transactions.parquet"
-    if not transactions.exists():
-        raise FileNotFoundError(f"{transactions} not found - run python -m src.data.sampling first.")
-    article_ids = sorted(pl.read_parquet(transactions, columns=["article_id"])["article_id"].unique().to_list())
+def catalog_with_photos() -> list[int]:
+    article_ids = catalog()
 
     present = [a for a in article_ids if image_path(a).exists()]
     missing = len(article_ids) - len(present)
     if missing > MAX_MISSING_FRACTION * len(article_ids):
         raise RuntimeError(
-            f"{missing:,} of {len(article_ids):,} sampled articles have no photo under {RAW_IMAGES}. "
+            f"{missing:,} of {len(article_ids):,} catalog articles have no photo under {RAW_IMAGES}. "
             "That is more than expected - check the image folder layout."
         )
-    print(f"{len(present):,} sampled articles with photos ({missing:,} without)")
+    print(f"{len(present):,} catalog articles with photos ({missing:,} without)")
     return present
 
 
-def extract(encoder: str = "resnet18", force: bool = False) -> pl.DataFrame:
-    out = embeddings_path(encoder)
+def extract(force: bool = False) -> pl.DataFrame:
+    out = IMAGE_EMBEDDINGS
     if out.exists() and not force:
         print(f"{out.name} already cached, skipping")
         return pl.read_parquet(out)
 
-    article_ids = sampled_articles()
+    article_ids = catalog_with_photos()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    encode, transform = ENCODERS[encoder](device)
+    model, _, transform = open_clip.create_model_and_transforms(FASHION_SIGLIP)
+    model.eval().to(device)
 
     loader = DataLoader(
         ArticleImages(article_ids, transform),
         batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS,
+        multiprocessing_context="spawn",
         pin_memory=device == "cuda",
     )
 
@@ -110,10 +90,10 @@ def extract(encoder: str = "resnet18", force: bool = False) -> pl.DataFrame:
         for batch, batch_ids in loader:
             batch = batch.to(device, non_blocking=True)
             with torch.autocast(device, dtype=torch.float16, enabled=device == "cuda"):
-                out_batch = encode(batch)
+                out_batch = model.encode_image(batch)
             embeddings.append(torch.nn.functional.normalize(out_batch.float(), dim=1).cpu())
             ids.append(batch_ids)
-            print(f"  {encoder}: {sum(len(i) for i in ids):,} / {len(article_ids):,}", end="\r")
+            print(f"  {sum(len(i) for i in ids):,} / {len(article_ids):,}", end="\r")
 
     embeddings = torch.cat(embeddings)
     dim = embeddings.shape[1]
@@ -130,6 +110,4 @@ def extract(encoder: str = "resnet18", force: bool = False) -> pl.DataFrame:
 
 
 if __name__ == "__main__":
-    force = "--force" in sys.argv
-    for name in ENCODERS:
-        extract(name, force=force)
+    extract(force="--force" in sys.argv)

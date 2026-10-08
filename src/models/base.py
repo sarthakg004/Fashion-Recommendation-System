@@ -6,7 +6,7 @@ class be scored on its own as one of the five models and pooled as a candidate
 source by the two-stage ranker without a wrapper in between.
 
 Customers a model knows nothing about get ``fallback``. Scored on its own, a model
-passes the popularity list so nobody is left empty-handed. As a retriever it
+passes last week's bestsellers so nobody is left empty-handed. As a retriever it
 passes nothing, because the bestseller retriever already covers everyone and
 duplicating it would waste pool slots.
 """

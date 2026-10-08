@@ -4,11 +4,19 @@ Every model reads the same parquet files written by ``src/data/sampling.py``, so
 the loading lives here rather than in five copies. The date arithmetic that every
 model repeats - how far a purchase sits from the end of its window, and where a
 given week starts and ends - lives here for the same reason.
+
+Two things come from the whole store rather than the 6% sample, because a shop
+knows them about every customer: how much each article sells, and therefore which
+articles exist to be recommended. ``population_sales`` and ``available_articles``
+only ever return days up to the end of the history they are given, so a model can
+never learn that an article will sell, or even that it exists, from the week it is
+predicting.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+from functools import cache
 
 import polars as pl
 
@@ -59,7 +67,7 @@ def days_before_end(transactions: pl.DataFrame) -> pl.Expr:
     return (pl.lit(transactions["t_dat"].max()) - pl.col("t_dat")).dt.total_days()
 
 
-def holdout_split(weeks_back: int = 0, window_weeks: int | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
+def holdout_split(weeks_back: int = 0) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Fitting frame and evaluation week, counted back from the test week.
 
     ``weeks_back=0`` reproduces the fixed split exactly: everything before the
@@ -69,21 +77,11 @@ def holdout_split(weeks_back: int = 0, window_weeks: int | None = None) -> tuple
     from one week carries the quirks of that week, and on a fashion catalog
     those are real: a cold snap or a promotion moves the bestseller list enough
     to move the score.
-
-    ``window_weeks`` fixes how much history each fold gets instead of letting it
-    grow toward the present. With the default expanding window a later fold has
-    both a different evaluation week and more data to fit on, so "that week was
-    harder" cannot be told apart from "that fold had less to learn from". Holding
-    the window at a fixed number of weeks removes the second difference and
-    leaves only the week.
     """
     transactions = load_transactions()
     start, end = week_bounds(transactions["t_dat"].max(), weeks_back)
-    history = pl.col("t_dat") < start
-    if window_weeks is not None:
-        history = history & (pl.col("t_dat") >= start - dt.timedelta(days=7 * window_weeks))
     return (
-        transactions.filter(history),
+        transactions.filter(pl.col("t_dat") < start),
         transactions.filter((pl.col("t_dat") >= start) & (pl.col("t_dat") <= end)),
     )
 
@@ -95,3 +93,38 @@ def purchases_by_customer(transactions: pl.DataFrame) -> dict[str, list[int]]:
     """
     grouped = transactions.sort("t_dat").group_by("customer_id").agg(pl.col("article_id"))
     return dict(zip(grouped["customer_id"].to_list(), grouped["article_id"].to_list()))
+
+
+@cache
+def load_article_sales() -> pl.DataFrame:
+    """Daily sales of every article across all customers in the window: ``t_dat, article_id, sales, revenue``."""
+    path = SAMPLE / "article_sales.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found - run python -m src.data.sampling first.")
+    return pl.read_parquet(path)
+
+
+def catalog() -> list[int]:
+    """Every article anyone bought inside the window, the rows item features are built for.
+
+    This includes articles first sold in the test week, so it is never a list of
+    candidates on its own: each fit narrows it with ``available_articles``.
+    """
+    return sorted(load_article_sales()["article_id"].unique().to_list())
+
+
+def population_sales(history: pl.DataFrame) -> pl.DataFrame:
+    """Store-wide daily sales up to and including the last day of ``history``."""
+    return load_article_sales().filter(pl.col("t_dat") <= history["t_dat"].max())
+
+
+def available_articles(history: pl.DataFrame) -> set[int]:
+    """Articles anyone had bought by the end of ``history``: what a model fitted on it may recommend.
+
+    An article first sold after that day did not exist yet as far as the model
+    can know. Offering only those is what keeps the candidate list from carrying
+    the answer: the old catalog was every article bought anywhere in the sample,
+    test week included, which told the models which brand new articles were about
+    to sell.
+    """
+    return set(population_sales(history)["article_id"].unique().to_list())

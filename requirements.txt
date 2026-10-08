@@ -20,6 +20,8 @@ nbclient==0.10.4
 ipykernel==7.1.0
 
 open_clip_torch==3.3.0
+# FashionSigLIP's text tokenizer
+transformers==5.17.0
 
 fastapi==0.128.1
 uvicorn==0.40.0

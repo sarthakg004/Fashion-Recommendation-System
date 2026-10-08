@@ -16,9 +16,17 @@
                          another colour (a shared product_code), and this product
                          type. The exact article is the narrowest of the three and
                          was the only one the ranker used to see.
+    content similarity   model 3's score for the pair - how close the candidate's
+                         categories, description and photo sit to everything the
+                         customer has bought. The counts above only see purchases of
+                         the same product or type; this sees a customer who buys
+                         soft neutral knitwear being offered more of it.
 
 Every statistic is computed from the history frame the retrievers were fitted on,
-never from the week being labelled or scored. The order of ``feature_names`` is
+never from the week being labelled or scored. The article statistics are counted
+over the whole store up to the end of that history, since a shop knows every sale
+and not just the 6% sampled here; the customer statistics come from the sample,
+because those are the customers being ranked for. The order of ``feature_names`` is
 the column order the ranker is trained and applied on.
 """
 
@@ -28,8 +36,9 @@ import datetime as dt
 
 import polars as pl
 
-from src.data.loading import load_articles
+from src.data.loading import load_articles, population_sales
 from src.models.base import Recommender
+from src.models.content import ContentRecommender
 
 MISSING_RANK = 9999
 
@@ -49,6 +58,7 @@ STATIC_FEATURES = [
     "times_bought_before",
     "product_bought_before",
     "type_bought_before",
+    "content_similarity",
 ]
 
 
@@ -68,18 +78,19 @@ def article_statistics(history: pl.DataFrame, bestsellers: list[int]) -> pl.Data
     with the same total that is fading, and total counts cannot express that.
     """
     last_day = history["t_dat"].max()
-    recent = history.filter(pl.col("t_dat") > last_day - dt.timedelta(days=7))
-    previous = history.filter(
+    sales = population_sales(history)
+    recent = sales.filter(pl.col("t_dat") > last_day - dt.timedelta(days=7))
+    previous = sales.filter(
         (pl.col("t_dat") <= last_day - dt.timedelta(days=7)) & (pl.col("t_dat") > last_day - dt.timedelta(days=14))
     )
 
-    stats = history.group_by("article_id").agg(
-        pl.len().alias("article_purchases"),
+    stats = sales.group_by("article_id").agg(
+        pl.col("sales").sum().alias("article_purchases"),
         ((pl.lit(last_day) - pl.col("t_dat").max()).dt.total_days()).alias("article_days_since_sold"),
-        pl.col("price").mean().alias("article_price"),
+        (pl.col("revenue").sum() / pl.col("sales").sum()).alias("article_price"),
     )
-    weekly = recent.group_by("article_id").agg(pl.len().alias("article_recent_purchases"))
-    prior = previous.group_by("article_id").agg(pl.len().alias("article_prior_purchases"))
+    weekly = recent.group_by("article_id").agg(pl.col("sales").sum().alias("article_recent_purchases"))
+    prior = previous.group_by("article_id").agg(pl.col("sales").sum().alias("article_prior_purchases"))
     ranks = pl.DataFrame({"article_id": bestsellers, "popularity_rank": range(1, len(bestsellers) + 1)})
 
     return (
@@ -124,13 +135,17 @@ def affinity_statistics(history: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFra
 
 
 def add_features(pool: pl.DataFrame, history: pl.DataFrame, article_stats: pl.DataFrame,
-                 customer_stats: pl.DataFrame, ranks: list[str]) -> pl.DataFrame:
-    """Join every feature onto a candidate pool; ``ranks`` are the pool's ``rank_<retriever>`` columns."""
+                 customer_stats: pl.DataFrame, ranks: list[str], content: ContentRecommender) -> pl.DataFrame:
+    """Join every feature onto a candidate pool.
+
+    ``ranks`` are the pool's ``rank_<retriever>`` columns, and ``content`` is a
+    content model fitted on the same ``history``.
+    """
     repurchase = history.group_by("customer_id", "article_id").agg(pl.len().alias("times_bought_before"))
     by_code, by_type = affinity_statistics(history)
     article_groups = load_articles().select("article_id", "product_code", "product_type_no")
 
-    return (
+    featured = (
         pool.with_columns(
             pl.sum_horizontal([pl.col(column).is_not_null().cast(pl.Int32) for column in ranks]).alias("n_sources"),
             pl.min_horizontal([pl.col(column) for column in ranks]).fill_null(MISSING_RANK).cast(pl.Int32).alias("best_rank"),
@@ -164,4 +179,7 @@ def add_features(pool: pl.DataFrame, history: pl.DataFrame, article_stats: pl.Da
         )
         .drop("product_code", "product_type_no")
         .sort("customer_id", "article_id")
+    )
+    return featured.with_columns(
+        pl.Series("content_similarity", content.similarity(featured["customer_id"].to_list(), featured["article_id"].to_list()))
     )

@@ -104,8 +104,10 @@ def beyond_accuracy(predictions, popularity, category_of, catalog_size, k=12) ->
         diversity  distinct product types within a top-k list over k, averaged
                    over customers
 
-    ``popularity`` is ``{article_id: purchase count}`` over the fitting data and
-    ``category_of`` is ``{article_id: product type}``.
+    ``popularity`` is ``{article_id: purchase count}`` over the fitting data,
+    ``category_of`` is ``{article_id: product type}``, and ``catalog_size`` is how
+    many articles the model could have recommended - the ones on sale, not every
+    row of ``articles.csv``, or coverage reads several times too low.
     """
     total = sum(popularity.values())
     seen, novelty, diversity, n = set(), 0.0, 0.0, 0

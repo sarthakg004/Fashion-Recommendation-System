@@ -21,6 +21,7 @@ import polars as pl
 
 from src.evaluation.metrics import KS
 from src.models.base import Recommender
+from src.models.content import ContentRecommender
 from src.models.popularity import PopularityRecommender, RecentBestsellers
 from src.models.two_tower import TwoTowerRecommender
 
@@ -30,18 +31,33 @@ N_RECOMMENDATIONS = max(KS)
 def default_retrievers() -> list[Recommender]:
     """The pool the two-stage model uses.
 
-    Two retrievers, roughly 1,050 candidates per customer, reaching a recall
-    ceiling of about 0.47. Pooling six retrievers at ~500 candidates each reached
-    0.32, so this is both smaller in code and larger in coverage: what sells
-    right now plus what the two-tower thinks this customer wants covers most of
-    what the others were contributing, and both scale to large k where the
-    heuristics run out of candidates.
+    Recent bestsellers and the two-tower at 700 candidates each, plus the content
+    model at 200. An earlier pool of six at ~500 each - these plus ALS, each
+    customer's previous purchases, and other colourways of them - reached a recall
+    ceiling of only 0.32: what sells right now plus what the two-tower thinks this
+    customer wants covers most of what the others contributed, and both keep
+    paying at large k where the heuristics ran out of candidates.
 
-    ``AlsRecommender``, ``ContentRecommender`` and the two classes in
-    ``src/models/heuristics.py`` can all be pooled back in, but they are not in
-    the default pool today.
+    The content model is back for the articles no sampled customer has bought. The
+    two-tower can reach those too, but its learned per-article vector only grows
+    for articles that were bought, so it favours them; on the test week's
+    purchases of such articles content reaches recall@100 0.024 against the
+    two-tower's 0.012. Its k was picked on the validation week, where 0, 50, 100,
+    200 and 400 content candidates gave ceilings of 0.486, 0.489, 0.490, 0.492 and
+    0.497 for pools of 1,065 to 1,303 per customer: a small gain, because most of
+    what it nominates the two-tower already has. 200 takes most of it for a tenth
+    more rows.
     """
-    return [RecentBestsellers(k=700), TwoTowerRecommender(k=700)]
+    return [RecentBestsellers(k=700), TwoTowerRecommender(k=700), ContentRecommender(k=200)]
+
+
+def content_model(retrievers: list[Recommender], history) -> ContentRecommender:
+    """The fitted content model in the pool, which also supplies the ranker's similarity feature.
+
+    Pools without one fit their own on ``history``, since the feature is needed either way.
+    """
+    pooled = next((r for r in retrievers if isinstance(r, ContentRecommender)), None)
+    return pooled if pooled is not None else ContentRecommender().fit(history)
 
 
 def bestseller_list(retrievers: list[Recommender]) -> list[int]:

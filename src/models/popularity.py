@@ -2,7 +2,9 @@
 
 The simplest thing that can be called a recommender: count how many times each
 article was bought during the training weeks, sort by that count, and hand the
-same top-100 list to every customer. There is no personalisation at all - two
+same top-100 list to every customer. The count is over the whole store, not the
+6% sample, because the shop knows every sale; ``fit`` only reads the training
+frame to know which days it covers. There is no personalisation at all - two
 customers with nothing in common get identical recommendations.
 
 It exists to set the floor. A personalised model that cannot beat "everyone gets
@@ -12,7 +14,7 @@ all purchases.
 
 The same count restricted to the last few days is ``RecentBestsellers``, the
 two-stage model's strongest retriever: what is selling right now beats any model
-trained on a four-month average (recall 0.178 at k=300 on the test week).
+trained on a four-month average.
 
 Run it with ``python -m src.models.popularity`` to score it and append the row to
 results/metrics_comparison.csv.
@@ -24,7 +26,7 @@ from collections.abc import Iterable, Sequence
 
 import polars as pl
 
-from src.data.loading import load_fitting_data, load_transactions, purchases_by_customer
+from src.data.loading import load_fitting_data, load_transactions, population_sales, purchases_by_customer
 from src.evaluation.metrics import KS, evaluate
 from src.evaluation.reporting import print_scores, save_result
 from src.models.base import Recommender
@@ -34,7 +36,7 @@ N_RECOMMENDATIONS = max(KS)
 
 
 class PopularityRecommender(Recommender):
-    """The most bought articles, optionally only over the final ``days`` of the frame."""
+    """The articles the whole store bought most, optionally only over the final ``days`` of the frame."""
 
     name = "popularity"
     default_k = N_RECOMMENDATIONS
@@ -45,12 +47,13 @@ class PopularityRecommender(Recommender):
         self.ranked: list[int] = []
 
     def fit(self, train: pl.DataFrame) -> "PopularityRecommender":
+        sales = population_sales(train)
         if self.days is not None:
-            train = train.filter(pl.col("t_dat") > train["t_dat"].max() - pl.duration(days=self.days))
+            sales = sales.filter(pl.col("t_dat") > train["t_dat"].max() - pl.duration(days=self.days))
         self.ranked = (
-            train.group_by("article_id")
-            .agg(pl.len().alias("purchases"))
-            .sort("purchases", descending=True)
+            sales.group_by("article_id")
+            .agg(pl.col("sales").sum().alias("purchases"))
+            .sort(["purchases", "article_id"], descending=[True, False])
             .head(self.k)["article_id"]
             .to_list()
         )

@@ -17,17 +17,14 @@ measured apart here:
                    before it. This is how much the score depends on which week
                    you happened to test on, and it is the larger of the two.
 
-The folds are not interchangeable. Fold 0 holds out the last week and, with the
-default expanding window, has the most history to fit on; each earlier fold has
-one week less. ``--window-weeks`` holds every fold to the same length of history
-instead, and doing so did not shrink the spread across folds: the weeks
-genuinely differ, so folds are reported individually rather than only as one
-average.
+The folds are not interchangeable. Fold 0 holds out the last week and has the
+most history to fit on; each earlier fold has one week less. Holding every fold
+to the same 16 weeks of history instead did not shrink the spread across folds -
+that run is documented in the README - so the weeks genuinely differ, and folds
+are reported individually rather than only as one average.
 
-Run it with ``python -m src.evaluation.cross_validation`` for the expanding
-window, which writes ``results/cross_validation.csv``, or with
-``--window-weeks 16`` for the fixed window, which writes
-``results/cross_validation_sliding.csv``. Each writes a ``_summary.csv`` beside it.
+Run it with ``python -m src.evaluation.cross_validation``; it writes
+``results/cross_validation.csv`` and a ``_summary.csv`` beside it.
 """
 
 from __future__ import annotations
@@ -36,7 +33,6 @@ import os
 
 os.environ.setdefault("POLARS_MAX_THREADS", "4")
 
-import argparse
 import gc
 from pathlib import Path
 
@@ -46,7 +42,6 @@ from src.paths import RESULTS
 from src.ranking.two_stage import evaluate_two_stage
 
 RESULTS_PATH = RESULTS / "cross_validation.csv"
-SLIDING_RESULTS_PATH = RESULTS / "cross_validation_sliding.csv"
 CV_METRICS = ("map@12", "recall@12", "ndcg@12", "hitrate@12", "recall@100")
 
 
@@ -59,12 +54,10 @@ class RollingOriginValidator:
     object across folds would leak the week being scored.
     """
 
-    def __init__(self, folds: int = 3, seeds: tuple[int, ...] = (42,), verbose: bool = True,
-                 window_weeks: int | None = None):
+    def __init__(self, folds: int = 3, seeds: tuple[int, ...] = (42,), verbose: bool = True):
         self.folds = folds
         self.seeds = tuple(seeds)
         self.verbose = verbose
-        self.window_weeks = window_weeks
         self.runs: pl.DataFrame | None = None
 
     def run(self) -> pl.DataFrame:
@@ -73,14 +66,12 @@ class RollingOriginValidator:
 
         for fold in range(self.folds):
             for seed in self.seeds:
-                result = evaluate_two_stage(verbose=False, save=False, weeks_back=fold, seed=seed,
-                                            window_weeks=self.window_weeks)
+                result = evaluate_two_stage(verbose=False, save=False, weeks_back=fold, seed=seed)
                 scores, retrieval = result.scores, result.retrieval_scores
                 rows.append(
                     {
                         "fold": fold,
                         "seed": seed,
-                        "window_weeks": self.window_weeks or 0,
                         "n_customers": scores["n_customers"],
                         "ceiling": round(result.ceiling, 5),
                         **{metric: round(scores[metric], 6) for metric in CV_METRICS},
@@ -127,16 +118,10 @@ class RollingOriginValidator:
 
 
 def main() -> pl.DataFrame:
-    parser = argparse.ArgumentParser(description="Cross-validate the two-stage model over four weeks and three seeds.")
-    parser.add_argument("--window-weeks", type=int, default=None,
-                        help="fix every fold to this many weeks of history instead of an expanding window")
-    args = parser.parse_args()
-
-    validator = RollingOriginValidator(folds=4, seeds=(42, 7, 13), window_weeks=args.window_weeks)
+    validator = RollingOriginValidator(folds=4, seeds=(42, 7, 13))
     validator.run()
     print(validator.summary())
-    path = RESULTS_PATH if args.window_weeks is None else SLIDING_RESULTS_PATH
-    print(f"written to {validator.save(path)}")
+    print(f"written to {validator.save()}")
     return validator.runs
 
 

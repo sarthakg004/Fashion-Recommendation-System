@@ -7,21 +7,19 @@ The winning Kaggle solutions did not pick one - they pooled candidates from many
 cheap retrievers and trained a ranker to sort the pool. This is that idea at a
 readable scale.
 
-Stage one, recall: two retrievers nominate 700 candidates each and the union
-becomes the candidate set - what sold in the last seven days, which nothing here
-beats on a catalog that turns over weekly, and the two-tower, the strongest
-learned retriever of the five. Earlier versions pooled six retrievers at 500
-candidates each and reached a recall ceiling of 0.32; these two at 700 reach about
-0.47 on a third of the code, because the other four were mostly nominating
-articles these two already had. The rest are kept because they stay cheap to pool
-back in, not because the default needs them. The pool is built in
-``src/ranking/candidates.py``.
+Stage one, recall: three retrievers nominate candidates and the union becomes the
+candidate set - what sold in the last seven days, which nothing here beats on a
+catalog that turns over weekly, and the two-tower, the strongest learned retriever
+of the five, at 700 each, plus the content model at 200 for articles no sampled
+customer has bought yet. Earlier versions pooled six retrievers at 500 candidates
+each and reached a recall ceiling of 0.32, because most of them were nominating
+articles these already had. The pool is built in ``src/ranking/candidates.py``.
 
 The ceiling is what the pool makes reachable, and roughly half of test purchases
 are not in it at any size tried. Retrieval, not ranking, is still the larger loss
 in this system.
 
-Stage two, ranking: describe every (customer, candidate) pair with seventeen
+Stage two, ranking: describe every (customer, candidate) pair with nineteen
 features and train LightGBM's lambdarank objective on them. Each tree corrects
 what the trees before it got wrong, and the learning rate decides how much of
 that correction to apply.
@@ -32,8 +30,11 @@ trees land within 0.0004 MAP@12 of each other, which is inside this pipeline's
 run-to-run variance. 600 is kept because it is the cheapest of three equivalent
 options, not because it scored highest. What did matter was the features: going
 from nine to seventeen moved test MAP@12 by about 9%, and three of the five
-strongest features by gain are among the new ones. The features themselves, and
-why each exists, are described in ``src/ranking/features.py``.
+strongest features by gain are among the new ones. The eighteenth is model 3's
+content similarity between the candidate and the customer's purchases: averaged
+over three runs it lifted test MAP@12 from 0.0295 to 0.0309, and it became the
+second strongest feature by gain. The features themselves, and why each exists,
+are described in ``src/ranking/features.py``.
 
 The ranker learns from LABEL_WEEKS consecutive weeks, not one. Each training week
 is built with a rolling origin: retrievers are refitted on everything strictly
@@ -99,14 +100,14 @@ import numpy as np
 import polars as pl
 from lightgbm import LGBMRanker
 
-from src.data.loading import holdout_split, load_articles, purchases_by_customer, week_bounds
+from src.data.loading import available_articles, holdout_split, load_articles, population_sales, purchases_by_customer, week_bounds
 from src.evaluation.metrics import KS, beyond_accuracy, evaluate, evaluate_segments
 from src.evaluation.reporting import print_scores, save_result, write_report
-from src.models.base import Recommender
 from src.ranking.candidates import (
     bestseller_list,
     build_pool,
     candidate_frame,
+    content_model,
     default_retrievers,
     oracle_recall,
     take_top,
@@ -164,7 +165,7 @@ def downsample(pool: pl.DataFrame, negatives_per_customer: int = NEGATIVES_PER_C
     return pl.concat([positives, negatives])
 
 
-def label_weeks(n_weeks: int, fitting: pl.DataFrame):
+def label_weeks(fitting: pl.DataFrame):
     """Rolling origin: each week paired with the history available before it.
 
     ``fitting`` is everything the model may learn from, so its final week is the
@@ -172,7 +173,7 @@ def label_weeks(n_weeks: int, fitting: pl.DataFrame):
     """
     last_day = fitting["t_dat"].max()
 
-    for index in range(n_weeks):
+    for index in range(LABEL_WEEKS):
         start, end = week_bounds(last_day, index)
         week = fitting.filter((pl.col("t_dat") >= start) & (pl.col("t_dat") <= end))
         history = fitting.filter(pl.col("t_dat") < start)
@@ -204,10 +205,8 @@ class TwoStageRanker:
     ranks the customers it is given, a batch at a time.
     """
 
-    def __init__(self, retrievers: list[Recommender] | None = None, n_weeks: int = LABEL_WEEKS,
-                 seed: int = SEED, verbose: bool = True):
-        self.retrievers = retrievers or default_retrievers()
-        self.n_weeks = n_weeks
+    def __init__(self, seed: int = SEED, verbose: bool = True):
+        self.retrievers = default_retrievers()
         self.seed = seed
         self.verbose = verbose
 
@@ -221,8 +220,9 @@ class TwoStageRanker:
         than on how many candidates each retriever nominates.
         """
         weeks = []
-        for index, history, truth in label_weeks(self.n_weeks, fitting):
+        for index, history, truth in label_weeks(fitting):
             retrievers = [r.fit(history) for r in default_retrievers()]
+            content = content_model(retrievers, history)
             ranks = rank_columns(retrievers)
             bestsellers = bestseller_list(retrievers)
             article_stats, customer_stats = article_statistics(history, bestsellers), customer_statistics(history)
@@ -232,7 +232,7 @@ class TwoStageRanker:
                 candidates = attach_labels(build_pool(retrievers, batch), truth)
                 raw_pairs += candidates.height
                 positives += int(candidates["bought"].sum())
-                batches.append(add_features(downsample(candidates, seed=self.seed), history, article_stats, customer_stats, ranks))
+                batches.append(add_features(downsample(candidates, seed=self.seed), history, article_stats, customer_stats, ranks, content))
                 del candidates
                 gc.collect()
 
@@ -241,7 +241,7 @@ class TwoStageRanker:
             if self.verbose:
                 print(f"  label week -{index}: {len(truth):,} customers, {raw_pairs:,} pairs, "
                       f"{positives:,} positives -> {weekly.height:,} training rows")
-            del batches, retrievers
+            del batches, retrievers, content
             gc.collect()
         return pl.concat(weeks).sort("week", "customer_id")
 
@@ -251,6 +251,7 @@ class TwoStageRanker:
 
         for retriever in self.retrievers:
             retriever.fit(fitting)
+        self.content = content_model(self.retrievers, fitting)
 
         self.features = feature_names(self.retrievers)
         self.ranks = rank_columns(self.retrievers)
@@ -273,7 +274,7 @@ class TwoStageRanker:
         for batch in batched(list(truth), CUSTOMER_BATCH):
             pool = build_pool(self.retrievers, batch)
             reachable.append(oracle_recall(pool, {c: truth[c] for c in batch}))
-            featured = add_features(pool, self.fitting, self.article_stats, self.customer_stats, self.ranks)
+            featured = add_features(pool, self.fitting, self.article_stats, self.customer_stats, self.ranks, self.content)
             scored = featured.with_columns(pl.Series("score", self.model.predict(featured.select(self.features).to_numpy())))
             predictions.update(take_top(scored, "score", batch, self.bestsellers, descending=True))
             retrieved.update(take_top(featured, "best_rank", batch, self.bestsellers, descending=False))
@@ -316,28 +317,23 @@ class TwoStageResult:
         ).sort("ceiling", descending=True)
 
 
-def evaluate_two_stage(retrievers: list[Recommender] | None = None, n_weeks: int = LABEL_WEEKS, verbose: bool = True,
-                       save: bool = False, weeks_back: int = 0, seed: int = SEED,
-                       window_weeks: int | None = None) -> TwoStageResult:
+def evaluate_two_stage(verbose: bool = True, save: bool = False, weeks_back: int = 0, seed: int = SEED) -> TwoStageResult:
     """Fit both stages on one held-out split and score them.
 
     ``weeks_back`` chooses which week to hold out, counting back from the test
     week, and ``seed`` drives both the negative sample and the ranker. Varying
     them is how the cross-validation in ``src/evaluation/cross_validation.py``
     separates a real difference from the noise of one week and one random draw.
-    ``window_weeks`` caps how much history is used, which is what holds training
-    size constant while the evaluation week moves. ``save`` writes the comparison
-    row and ``results/two_stage_report.json``.
+    ``save`` writes the comparison row and ``results/two_stage_report.json``.
     """
-    retrievers = retrievers or default_retrievers()
-    fitting, evaluation = holdout_split(weeks_back, window_weeks)
+    fitting, evaluation = holdout_split(weeks_back)
     truth = purchases_by_customer(evaluation)
 
-    ranker = TwoStageRanker(retrievers, n_weeks, seed, verbose).fit(fitting)
+    ranker = TwoStageRanker(seed, verbose).fit(fitting)
     predictions, retrieved, ceiling, pool_rows = ranker.predict(truth)
     scores = evaluate(predictions, truth)
 
-    counts = fitting.group_by("article_id").agg(pl.len().alias("n"))
+    counts = population_sales(fitting).group_by("article_id").agg(pl.col("sales").sum().alias("n"))
     catalog = load_articles().select("article_id", "product_type_no")
     retrieval_scores = evaluate(retrieved, truth)
     segments = evaluate_segments(predictions, truth, customer_segments(fitting, truth))
@@ -345,7 +341,7 @@ def evaluate_two_stage(retrievers: list[Recommender] | None = None, n_weeks: int
         predictions,
         dict(zip(counts["article_id"].to_list(), counts["n"].to_list())),
         dict(zip(catalog["article_id"].to_list(), catalog["product_type_no"].to_list())),
-        catalog.height,
+        len(available_articles(fitting)),
     )
 
     if save:
